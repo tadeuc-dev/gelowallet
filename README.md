@@ -60,6 +60,8 @@ decisão de transmitir para você.
 
 ### Transações (P2WPKH / SegWit)
 - Montagem em perguntas simples: **origem → destino → valor → taxa**.
+- **`MAX`** no valor esvazia as origens: usa todos os UTXOs, envia o saldo menos
+  a taxa e não cria saída de troco.
 - **Múltiplas origens** numa mesma transação (endereços separados por vírgula).
 - **Taxa consultada na rede**, com o valor em uso exibido antes de assinar.
 - **Troco** volta para o endereço de origem (ou outro que você informar).
@@ -91,6 +93,24 @@ decisão de transmitir para você.
 - Detecção clara de arquivo corrompido × senha incorreta.
 - Trava de instância única (`wallets.json.lock`) impede duas sessões simultâneas; o arquivo é removido ao sair normalmente ou com Ctrl+C, sem apagar a trava de outra sessão.
 - Opção inválida nos menus de carteiras mostra o erro na hora e reabre a digitação, sem pedir a Senha Mestra novamente.
+
+### Memória e encerramento
+
+- **Core dump desativado** (`RLIMIT_CORE=0`) e processo **não-dumpável**
+  (`PR_SET_DUMPABLE=0` no Linux): reduz o risco de a memória do cofre parar em
+  arquivos de crash ou ser lida por `/proc/<pid>/mem`.
+- Ao abrir uma carteira, o cofre é descriptografado (o formato atual é um único
+  blob Fernet) e **todas as outras carteiras são apagadas da memória na hora**;
+  só a escolhida permanece durante o menu.
+- Ao sair (inclusive Ctrl+C): referências são descartadas, o garbage collector
+  roda, `malloc_trim` devolve páginas livres ao SO e a tela/scrollback é limpa.
+- Senhas e buffers internos controláveis são tratados em `bytearray`/estruturas
+  sem `str` por caractere e **sobrescritos com zeros** após o uso; a Senha
+  Mestra vira um buffer temporário zerado na derivação Argon2id.
+- O que **não** dá para garantir em Python: `str`/`bytes` são imutáveis e cópias
+  podem restar no heap, no swap/hibernação ou em buffers do terminal/tmux. Para
+  sessões de alto valor, use sistema offline, swap criptografado (ou sem swap) e
+  evite multiplexadores que guardam histórico.
 
 ---
 
@@ -185,7 +205,8 @@ Opcoes da Carteira P2PKH:
 2. **Guardar**: responda `s` para salvar a carteira — você define um nome e a
    Senha Mestra.
 3. **Reabrir** (opção 3): digite a Senha Mestra, escolha a carteira.
-4. **Enviar** (opção 4): informe origem, destino, valor e a taxa.
+4. **Enviar** (opção 4): informe origem, destino, valor e a taxa. Digite `MAX`
+   no valor para esvaziar as origens (sem troco).
    Para WIF P2PKH/BTC Puzzle, importe pela opção 5 do menu principal e use a
    opção 4 do menu da carteira P2PKH (aceita `MAX` para esvaziar).
 5. **Transmitir**: copie o HEX gerado e transmita manualmente.
@@ -228,6 +249,19 @@ troco ultrapasse o mínimo.
 
 > O valor `294` **não é configurável**: é uma regra da rede Bitcoin. Baixá-lo não
 > daria troco — apenas criaria transações rejeitadas.
+
+### MAX (esvaziar as origens)
+
+Digite `MAX` no lugar do valor para gastar **todos** os UTXOs das origens
+informadas. O programa:
+
+- estima a taxa com **uma única saída** (destino) e o número real de entradas;
+- calcula `valor enviado = saldo total − taxa estimada`;
+- **não** cria saída de troco e não pergunta endereço de troco;
+- recusa se o valor restante ficar abaixo do dust (546 sats) ou não cobrir a taxa.
+
+Vale tanto para P2WPKH quanto para o fluxo P2PKH legado. No P2WPKH o PSBT gerado
+nesse modo tem apenas a saída de destino (sem marcação de troco).
 
 ---
 
@@ -332,6 +366,10 @@ risco e teste primeiro com valores pequenos.
 - Gera PSBT para P2WPKH, mas **não assina** PSBT de hardware (não integra
   Ledger/Trezor). O fluxo P2PKH gera apenas HEX.
 - Não é auditado por terceiros.
+- A limpeza de memória é **melhor esforço**: strings/bytes imutáveis do Python,
+  swap/hibernação e o scrollback do terminal/tmux não podem ser zerados de forma
+  garantida pelo programa. O cofre é um blob único (v2), então a leitura precisa
+  descriptografá-lo por inteiro antes de manter apenas a carteira escolhida.
 
 ---
 

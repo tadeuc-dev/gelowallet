@@ -29,6 +29,8 @@ Melhorias em relacao aos dois scripts originais:
     comprimida ou chave hex de 64 digitos, deriva o endereco 1... correto e
     assina com sighash legacy. Esse fluxo gera apenas HEX assinado (sem PSBT)
     e pode esvaziar o endereco com a opcao MAX.
+  - O fluxo P2WPKH tambem aceita MAX: gasta todos os UTXOs das origens, sem
+    troco, e envia o saldo menos a taxa estimada.
   - Argon2id (memory-hard) para derivar a chave da Senha Mestra; arquivos
     antigos em PBKDF2 (600k iteracoes) continuam abrindo e sao migrados
     para Argon2id no proximo desbloqueio.
@@ -56,6 +58,11 @@ Melhorias em relacao aos dois scripts originais:
     consultada na rede e o programa mostra qual esta sendo usada.
   - Saldos e troco sao lidos do mesmo endereco de origem, sem varrer a rede,
     mantendo a privacidade. O troco volta para o endereco de origem.
+  - Hardening de memoria: core dump desativado, processo nao-dumpavel
+    (PR_SET_DUMPABLE=0 no Linux), apenas a carteira escolhida fica em memoria
+    durante o menu, buffers bytearray controlaveis sao zerados e a tela/
+    scrollback e limpa ao sair. Strings imutaveis do Python, swap e o
+    historico do terminal/tmux nao podem ser zerados de forma garantida.
 
 AVISO: use por sua conta e risco. Nao transmite
 transacoes: o HEX/PSBT gerado deve ser transmitido manualmente. Por padrao
@@ -65,6 +72,7 @@ consultados; use GELOWALLET_API para apontar a um node proprio ou via Tor.
 
 import base64
 import codecs
+import gc
 import getpass
 import hashlib
 import hmac
@@ -80,6 +88,16 @@ try:
   import fcntl  # POSIX: trava exclusiva do cofre
 except ImportError:  # Windows
   fcntl = None
+
+try:
+  import resource  # POSIX: limite de core dump
+except ImportError:  # Windows
+  resource = None
+
+try:
+  import ctypes  # POSIX/Linux: prctl e malloc_trim (best effort)
+except ImportError:  # plataformas sem ctypes
+  ctypes = None
 
 try:
   import termios  # POSIX: leitura de senha com eco mascarado
@@ -406,27 +424,33 @@ def gerar_chave_fernet(master_password: str, salt: bytes, kdf=None, params=None)
     kdf = KDF_ATUAL
   if params is None:
     params = _parametros_kdf_atuais()
-  senha = master_password.encode()
+  # bytearray para poder sobrescrever a senha depois de derivar a chave.
+  # A biblioteca de KDF aceita bytes-like; o str original (API publica)
+  # continua imutavel, mas reduzimos as copias controlaveis.
+  senha = bytearray(master_password.encode())
 
-  if kdf == KDF_LEGADO:
-    derivador = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=salt,
-        iterations=int(params["iterations"]),
-    )
-    chave = derivador.derive(senha)
-  elif kdf == KDF_ATUAL:
-    derivador = Argon2id(
-        salt=salt,
-        length=32,
-        iterations=int(params["iterations"]),
-        lanes=int(params["lanes"]),
-        memory_cost=int(params["memory_cost"]),
-    )
-    chave = derivador.derive(senha)
-  else:
-    raise ArquivoCorrompido(f"KDF desconhecido no cofre: {kdf!r}")
+  try:
+    if kdf == KDF_LEGADO:
+      derivador = PBKDF2HMAC(
+          algorithm=hashes.SHA256(),
+          length=32,
+          salt=salt,
+          iterations=int(params["iterations"]),
+      )
+      chave = derivador.derive(senha)
+    elif kdf == KDF_ATUAL:
+      derivador = Argon2id(
+          salt=salt,
+          length=32,
+          iterations=int(params["iterations"]),
+          lanes=int(params["lanes"]),
+          memory_cost=int(params["memory_cost"]),
+      )
+      chave = derivador.derive(senha)
+    else:
+      raise ArquivoCorrompido(f"KDF desconhecido no cofre: {kdf!r}")
+  finally:
+    _zerar_buffer(senha)
   return base64.urlsafe_b64encode(chave)
 
 
@@ -519,8 +543,12 @@ def carregar_dados_criptografados(master_password: str):
     fernet = Fernet(chave)
     dados_decriptados = fernet.decrypt(
         conteudo["encrypted_data"].encode()
-    ).decode()
-    return json.loads(dados_decriptados)
+    )
+    try:
+      # json.loads aceita bytes: evita uma copia str adicional do cofre.
+      return json.loads(dados_decriptados)
+    finally:
+      del dados_decriptados
   except InvalidToken:
     return None
   except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as e:
@@ -577,9 +605,13 @@ def salvar_dados_criptografados(dados: dict, master_password: str):
       master_password, salt, kdf=KDF_ATUAL, params=params
   )
   fernet = Fernet(chave)
-  dados_criptografados = fernet.encrypt(
-      json.dumps(dados).encode()
-  ).decode()
+  # Fernet.encrypt exige bytes imutaveis; mantemos ao menos o buffer
+  # intermediario em bytearray e o zeramos em seguida.
+  texto = bytearray(json.dumps(dados).encode())
+  try:
+    dados_criptografados = fernet.encrypt(bytes(texto)).decode()
+  finally:
+    _zerar_buffer(texto)
   payload = {
       "version": VERSAO_FORMATO_COFRE,
       "kdf": KDF_ATUAL,
@@ -608,6 +640,114 @@ def _senha_fraca(senha: str) -> bool:
       for padrao in (r"[a-z]", r"[A-Z]", r"[0-9]", r"[^a-zA-Z0-9]")
   )
   return len(senha) < 16 and classes < 3
+
+
+def _zerar_buffer(buffer):
+  """Sobrescreve um bytearray/memoryview mutavel (melhor esforco).
+
+  Strings Python sao imutaveis e NAO podem ser zeradas; por isso os fluxos
+  internos usam bytearray/memoryview sempre que possivel e chamam esta
+  funcao antes de descartar o buffer.
+  """
+  try:
+    if isinstance(buffer, memoryview):
+      if not buffer.readonly:
+        buffer[:] = b"\x00" * len(buffer)
+    elif isinstance(buffer, bytearray):
+      buffer[:] = b"\x00" * len(buffer)
+  except (TypeError, ValueError, BufferError):
+    pass
+
+
+def _liberar_heap():
+  """Coleta lixo e devolve paginas livres ao SO (best effort, glibc)."""
+  try:
+    gc.collect()
+  except Exception:
+    pass
+  if ctypes is None:
+    return
+  try:
+    ctypes.CDLL(None).malloc_trim(0)
+  except (OSError, AttributeError):
+    pass
+
+
+_processo_endurecido = False
+
+
+def _endurecer_processo():
+  """Reduz a chance de segredos vazarem por core dump/ptrace.
+
+  - RLIMIT_CORE=0: nao gera core dump com a memoria do cofre.
+  - PR_SET_DUMPABLE=0 (Linux): impede leitura de /proc/<pid>/mem por outros
+    usuarios e anexacao de depurador.
+  Nao e possivel zerar toda a RAM em Python; isto e hardening, nao garantia.
+  """
+  global _processo_endurecido
+  if _processo_endurecido:
+    return
+  _processo_endurecido = True
+  if resource is not None:
+    try:
+      resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    except (OSError, ValueError):
+      pass
+  if ctypes is not None and os.name == "posix":
+    try:
+      libc = ctypes.CDLL(None, use_errno=True)
+      PR_SET_DUMPABLE = 4
+      libc.prctl(PR_SET_DUMPABLE, 0, 0, 0, 0)
+    except (OSError, AttributeError):
+      pass
+
+
+def _limpar_tela_ao_sair():
+  """Limpa a tela e o scrollback (best effort) ao encerrar."""
+  try:
+    sys.stdout.write("\033[3J\033[H\033[2J")
+    sys.stdout.flush()
+  except Exception:
+    pass
+
+
+def _apagar_carteira_em_memoria(carteira):
+  """Remove referencias aos segredos de uma carteira ja usada."""
+  if not isinstance(carteira, dict):
+    return
+  for campo in ("mnemonic", "passphrase", "_mnemonic", "_passphrase"):
+    if campo in carteira:
+      carteira[campo] = ""
+  metadados = carteira.get("metadados")
+  if not isinstance(metadados, dict):
+    return
+  enderecos = metadados.get("enderecos")
+  if not isinstance(enderecos, dict):
+    return
+  for item in enderecos.values():
+    if isinstance(item, dict) and "wif" in item:
+      item["wif"] = ""
+
+
+def _apagar_dados_em_memoria(dados):
+  """Apaga (referencias a) todas as carteiras descriptografadas."""
+  if not isinstance(dados, dict):
+    return
+  for carteira in dados.values():
+    _apagar_carteira_em_memoria(carteira)
+  dados.clear()
+
+
+def _impressao_metadados(metadados):
+  """Hash dos metadados, para detectar alteracoes sem guardar copia secreta."""
+  try:
+    bruto = bytearray(json.dumps(metadados, sort_keys=True).encode())
+    try:
+      return hashlib.sha256(bruto).hexdigest()
+    finally:
+      _zerar_buffer(bruto)
+  except (TypeError, ValueError):
+    return None
 
 
 def _descartar_sequencia_escape(fd):
@@ -656,16 +796,22 @@ def ler_senha_mascarada(prompt="", mascara="*"):
 
   fd = sys.stdin.fileno()
   configuracoes = termios.tcgetattr(fd)
-  senha = []
+  # Codigos Unicode (int), nao objetos str de 1 caractere: em CPython os
+  # caracteres ASCII sao cacheados/interned e nao podem ser zerados.
+  codigos = []
   decodificador = codecs.getincrementaldecoder(
       sys.stdin.encoding or "utf-8"
   )("replace")
+  resultado = ""
 
   def apagar_um():
-    if senha:
-      senha.pop()
+    if codigos:
+      codigos.pop()
       sys.stdout.write("\b \b")
       sys.stdout.flush()
+
+  def ultimo_e_espaco():
+    return bool(codigos) and chr(codigos[-1]).isspace()
 
   try:
     # TCSANOW: nao descarta o que o usuario ja digitou antes do prompt.
@@ -684,20 +830,20 @@ def ler_senha_mascarada(prompt="", mascara="*"):
       if byte == b"\x03":  # Ctrl+C (caso ISIG nao transforme em sinal)
         raise KeyboardInterrupt
       if byte == b"\x04":  # Ctrl+D
-        if not senha:
+        if not codigos:
           raise EOFError
         break
       if byte in (b"\x7f", b"\x08"):  # Backspace
         apagar_um()
         continue
       if byte == b"\x15":  # Ctrl+U
-        while senha:
+        while codigos:
           apagar_um()
         continue
       if byte == b"\x17":  # Ctrl+W
-        while senha and senha[-1].isspace():
+        while ultimo_e_espaco():
           apagar_um()
-        while senha and not senha[-1].isspace():
+        while codigos and not ultimo_e_espaco():
           apagar_um()
         continue
       if byte[0] < 0x20:
@@ -706,17 +852,19 @@ def ler_senha_mascarada(prompt="", mascara="*"):
       for caractere in decodificador.decode(byte):
         if caractere < " ":
           continue
-        senha.append(caractere)
+        codigos.append(ord(caractere))
         sys.stdout.write(mascara)
         sys.stdout.flush()
+    resultado = "".join(chr(c) for c in codigos)
   finally:
+    codigos.clear()
     try:
       termios.tcsetattr(fd, termios.TCSADRAIN, configuracoes)
     except Exception:
       pass
     sys.stdout.write("\n")
     sys.stdout.flush()
-  return "".join(senha)
+  return resultado
 
 
 def obter_dados_e_autenticar():
@@ -1566,8 +1714,10 @@ def criar_transacao(carteira):
   """Monta e assina uma transacao P2WPKH a partir da carteira carregada.
 
   Fluxo simples: pergunta o endereco de ORIGEM (ou varias, separadas por
-  virgula), o endereco de DESTINO, o valor e a taxa (consultada na rede).
-  O troco volta para o primeiro endereco de origem.
+  virgula), o endereco de DESTINO, o valor (ou MAX para esvaziar) e a taxa
+  (consultada na rede). O troco volta para o primeiro endereco de origem.
+  Com MAX nao ha troco: todos os UTXOs das origens sao gastos e o destino
+  recebe o saldo total menos a taxa estimada.
   NAO transmite: imprime o HEX assinado e oferece exportacao em arquivo
   (.hex) e PSBT sem assinatura (.psbt).
   """
@@ -1630,29 +1780,36 @@ def criar_transacao(carteira):
     erro(f"endereco de destino invalido: {e}")
     return
 
-  # --- 3) Valor ---
-  bruto = input("Valor a enviar em satoshis: ").strip().replace(",", ".")
-  try:
-    valor = int(bruto)
-  except ValueError:
-    erro("o valor deve ser um numero inteiro de satoshis.")
-    return
-  if valor <= 0:
-    erro("o valor deve ser um inteiro positivo.")
-    return
-  if valor > MAX_MONEY_SATS:
-    erro("o valor excede o limite de dinheiro existente no Bitcoin.")
-    return
-  if valor < DUST_DESTINO_AVISO:
-    print(
-        f"\nATENCAO: {valor} sats e inferior ao dust conservador "
-        f"({DUST_DESTINO_AVISO} sats). A rede pode REJEITAR a transacao e "
-        "o destinatario pode nunca receber o valor."
-    )
-    conf = input('Digite "CONFIRMAR" para prosseguir assim: ').strip().upper()
-    if conf != "CONFIRMAR":
-      print("Operacao cancelada.")
+  # --- 3) Valor (ou MAX para esvaziar todas as origens) ---
+  bruto = input(
+      "Valor a enviar em satoshis (ou MAX para esvaziar): "
+  ).strip().replace(",", ".")
+  enviar_tudo = bruto.upper() == "MAX"
+  valor = None
+  if not enviar_tudo:
+    try:
+      valor = int(bruto)
+    except ValueError:
+      erro("o valor deve ser um numero inteiro de satoshis ou MAX.")
       return
+    if valor <= 0:
+      erro("o valor deve ser um inteiro positivo.")
+      return
+    if valor > MAX_MONEY_SATS:
+      erro("o valor excede o limite de dinheiro existente no Bitcoin.")
+      return
+    if valor < DUST_DESTINO_AVISO:
+      print(
+          f"\nATENCAO: {valor} sats e inferior ao dust conservador "
+          f"({DUST_DESTINO_AVISO} sats). A rede pode REJEITAR a transacao e "
+          "o destinatario pode nunca receber o valor."
+      )
+      conf = input(
+          'Digite "CONFIRMAR" para prosseguir assim: '
+      ).strip().upper()
+      if conf != "CONFIRMAR":
+        print("Operacao cancelada.")
+        return
 
   # --- 4) Confere saldo das origens ---
   incluir_nc = input(
@@ -1719,30 +1876,38 @@ def criar_transacao(carteira):
     chaves[spk.serialize()] = (chave, pub)
 
   # --- 5) Endereco de troco: mesmo endereco da PRIMEIRA origem (padrao) ---
-  endereco_troco = origens[0]["meta"]["endereco"]
-  print(
-      f"\nTroco voltara para o proprio endereco de origem:"
-      f"\n  {endereco_troco}"
-  )
-  troco_informado = input(
-      "Outro endereco de troco (Enter = o da origem): "
-  ).strip()
-  if troco_informado:
-    endereco_troco = troco_informado
-  if not eh_endereco_mainnet(endereco_troco):
-    erro("o endereco de troco nao parece ser da rede principal.")
-    return
-  try:
-    spk_troco = script.address_to_scriptpubkey(endereco_troco)
-  except Exception as e:
-    erro(f"endereco de troco invalido: {e}")
-    return
-
-  if endereco_destino == endereco_troco:
+  endereco_troco = None
+  spk_troco = None
+  if enviar_tudo:
     print(
-        "\nAVISO: destino igual ao endereco de troco; o troco se juntara"
-        " ao valor enviado no mesmo endereco."
+        "\nMAX selecionado: nao havera saida de troco; todo o saldo "
+        "disponivel\nsera enviado ao destino, menos a taxa de rede."
     )
+  else:
+    endereco_troco = origens[0]["meta"]["endereco"]
+    print(
+        f"\nTroco voltara para o proprio endereco de origem:"
+        f"\n  {endereco_troco}"
+    )
+    troco_informado = input(
+        "Outro endereco de troco (Enter = o da origem): "
+    ).strip()
+    if troco_informado:
+      endereco_troco = troco_informado
+    if not eh_endereco_mainnet(endereco_troco):
+      erro("o endereco de troco nao parece ser da rede principal.")
+      return
+    try:
+      spk_troco = script.address_to_scriptpubkey(endereco_troco)
+    except Exception as e:
+      erro(f"endereco de troco invalido: {e}")
+      return
+
+    if endereco_destino == endereco_troco:
+      print(
+          "\nAVISO: destino igual ao endereco de troco; o troco se juntara"
+          " ao valor enviado no mesmo endereco."
+      )
 
   # --- 6) Taxa: consulta a rede e mostra a taxa em uso ---
   taxa_vb = escolher_taxa()
@@ -1750,50 +1915,88 @@ def criar_transacao(carteira):
     return
 
   # --- Selecao de entradas ---
-  entradas, total_entradas = montar_entradas(
-      naturezas, valor, taxa_vb, spk_destino
-  )
-
-  taxa_um_output, vsize_um = estimar_taxa(
-      len(entradas), [spk_destino], taxa_vb
-  )
-  taxa_dois_outputs, vsize_dois = estimar_taxa(
-      len(entradas), [spk_destino, spk_troco], taxa_vb
-  )
-
-  if total_entradas < valor + taxa_um_output:
-    erro(
-        "saldo insuficiente.\n"
-        f"  Entradas: {total_entradas} sats\n"
-        f"  Valor:    {valor} sats\n"
-        f"  Taxa:     {taxa_um_output} sats (1 output)"
+  if enviar_tudo:
+    # MAX: gasta TODOS os UTXOs das origens, sem saida de troco.
+    entradas = []
+    for grupo in naturezas:
+      for u in grupo["utxos"]:
+        entradas.append(
+            {
+                "txid": u["txid"],
+                "vout": u["vout"],
+                "value": u["value"],
+                "scriptPubKey": grupo["scriptPubKey"],
+                "natureza": grupo["meta"]["natureza"],
+                "conta": grupo["meta"]["conta"],
+                "index": grupo["meta"]["index"],
+                "fingerprint": grupo["meta"]["fingerprint"],
+            }
+        )
+    total_entradas = total_disponivel
+    taxa_calculada, vsize_final = estimar_taxa(
+        len(entradas), [spk_destino], taxa_vb
     )
-    return
-
-  troco_potencial = total_entradas - valor - taxa_dois_outputs
-
-  if troco_potencial >= DUST_TROCO_P2WPKH:
-    valor_troco = troco_potencial
-    taxa_calculada = taxa_dois_outputs
-    vsize_final = vsize_dois
-    tem_troco = True
+    valor = total_entradas - taxa_calculada
+    if valor <= 0:
+      erro("o saldo nao cobre a taxa estimada para esvaziar as origens.")
+      return
+    if valor < DUST_DESTINO_AVISO:
+      erro(
+          f"sobrariam {valor} sats depois da taxa, abaixo do dust "
+          f"({DUST_DESTINO_AVISO} sats). Nao ha como esvaziar."
+      )
+      return
+    valor_troco = 0
+    tem_troco = False
+    troco_potencial = 0
     saidas = [
         transaction.TransactionOutput(value=valor, script_pubkey=spk_destino),
-        transaction.TransactionOutput(
-            value=valor_troco, script_pubkey=spk_troco
-        ),
     ]
   else:
-    valor_troco = 0
-    taxa_calculada = total_entradas - valor
-    vsize_final = vsize_um
-    tem_troco = False
-    if taxa_calculada < taxa_um_output:
-      erro("o saldo nao cobre a taxa estimada.")
+    entradas, total_entradas = montar_entradas(
+        naturezas, valor, taxa_vb, spk_destino
+    )
+
+    taxa_um_output, vsize_um = estimar_taxa(
+        len(entradas), [spk_destino], taxa_vb
+    )
+    taxa_dois_outputs, vsize_dois = estimar_taxa(
+        len(entradas), [spk_destino, spk_troco], taxa_vb
+    )
+
+    if total_entradas < valor + taxa_um_output:
+      erro(
+          "saldo insuficiente.\n"
+          f"  Entradas: {total_entradas} sats\n"
+          f"  Valor:    {valor} sats\n"
+          f"  Taxa:     {taxa_um_output} sats (1 output)"
+      )
       return
-    saidas = [
-        transaction.TransactionOutput(value=valor, script_pubkey=spk_destino),
-    ]
+
+    troco_potencial = total_entradas - valor - taxa_dois_outputs
+
+    if troco_potencial >= DUST_TROCO_P2WPKH:
+      valor_troco = troco_potencial
+      taxa_calculada = taxa_dois_outputs
+      vsize_final = vsize_dois
+      tem_troco = True
+      saidas = [
+          transaction.TransactionOutput(value=valor, script_pubkey=spk_destino),
+          transaction.TransactionOutput(
+              value=valor_troco, script_pubkey=spk_troco
+          ),
+      ]
+    else:
+      valor_troco = 0
+      taxa_calculada = total_entradas - valor
+      vsize_final = vsize_um
+      tem_troco = False
+      if taxa_calculada < taxa_um_output:
+        erro("o saldo nao cobre a taxa estimada.")
+        return
+      saidas = [
+          transaction.TransactionOutput(value=valor, script_pubkey=spk_destino),
+      ]
   taxa_efetiva = taxa_calculada / vsize_final
 
   # --- Salvaguarda de taxa excessiva ---
@@ -1833,7 +2036,9 @@ def criar_transacao(carteira):
     print(f"Valor do troco      : {valor_troco} sats ({endereco_troco})")
   else:
     print("Valor do troco      : (sem saida de troco)")
-    if troco_potencial > 0:
+    if enviar_tudo:
+      print("  Motivo: voce pediu para esvaziar as origens (MAX).")
+    elif troco_potencial > 0:
       print(
           f"  Motivo: o troco calculado ({troco_potencial} sats) ficou abaixo"
           f"\n  do minimo de {DUST_TROCO_P2WPKH} sats (dust). Uma saida menor que"
@@ -1914,7 +2119,8 @@ def criar_transacao(carteira):
           )
         # Marca a saida de troco como nossa (PSBT_OUT_BIP32_DERIVATION),
         # para outra carteira reconhecer o troco automaticamente.
-        _marcar_troco_no_psbt(p, saidas, endereco_troco, origens)
+        if tem_troco and endereco_troco:
+          _marcar_troco_no_psbt(p, saidas, endereco_troco, origens)
         psbt_b64 = base64.b64encode(p.serialize()).decode()
         salvar_conteudo_em_arquivo(
             "transacao.psbt", psbt_b64 + "\n", "o PSBT (base64)"
@@ -2544,6 +2750,8 @@ def importar_wif_puzzle_como_carteira():
     )
     input("\nPressione Enter para voltar...")
     return
+  finally:
+    _apagar_dados_em_memoria(dados)
 
   print(
       f"\nCarteira P2PKH '{nome}' salva. Abra-a pelo menu principal"
@@ -2715,6 +2923,7 @@ def perguntar_e_salvar_carteira(mnemonic, passphrase, metadados=None):
   ).strip().lower()
   if resposta != "s":
     return False
+  dados = None
   try:
     dados, master_password = obter_dados_e_autenticar()
     nome = input("\nDigite um nome/alias para esta carteira: ").strip()
@@ -2740,6 +2949,8 @@ def perguntar_e_salvar_carteira(mnemonic, passphrase, metadados=None):
   except OSError as e:
     erro(f"falha de gravacao em {ARQUIVO_CARTEIRAS}: {e}")
     return False
+  finally:
+    _apagar_dados_em_memoria(dados)
 
 
 def criar_carteira():
@@ -2919,6 +3130,8 @@ def importar_wif_como_carteira():
     )
     input("\nPressione Enter para voltar...")
     return
+  finally:
+    _apagar_dados_em_memoria(dados)
 
   print(
       f"\nCarteira '{nome}' salva com a WIF importada. Abra-a pelo menu"
@@ -2985,13 +3198,23 @@ def gerenciar_carteiras():
 
     nome_escolhido = nomes[idx]
     if esc == "L":
-      carteira = dados[nome_escolhido]
+      # Mantem em memoria APENAS a carteira escolhida; as demais sao
+      # apagadas imediatamente (nao ficam descriptografadas na sessao).
+      carteira = dados.pop(nome_escolhido, None)
+      _apagar_dados_em_memoria(dados)
+      if not isinstance(carteira, dict):
+        erro("carteira invalida no cofre.")
+        return
       if carteira.get("tipo") == "p2pkh":
-        menu_carteira_p2pkh(carteira)
+        try:
+          menu_carteira_p2pkh(carteira)
+        finally:
+          _apagar_carteira_em_memoria(carteira)
         return
       metadados = carteira.get("metadados")
       if metadados is None:
         metadados = {"contas": [CONTA_PADRAO], "enderecos": {}}
+      impressao_antes = _impressao_metadados(metadados)
       try:
         menu_carteira(
             carteira.get("mnemonic", ""), carteira.get("passphrase", ""),
@@ -2999,18 +3222,29 @@ def gerenciar_carteiras():
         )
       except ArquivoCorrompido as e:
         erro(f"falha ao salvar alteracoes: {e}")
-        input("\nPressione Enter para continuar...")
-        continue
-      # Persiste os enderecos/metadados descobertos na sessao.
-      if carteira.get("metadados") != metadados:
+        _apagar_carteira_em_memoria(carteira)
+        input("\nPressione Enter para voltar ao menu principal...")
+        return
+      # Persiste os enderecos/metadados descobertos na sessao. Para isso,
+      # o cofre completo e descriptografado de novo por um instante e
+      # apagado logo apos a gravacao.
+      if _impressao_metadados(metadados) != impressao_antes:
         carteira["metadados"] = metadados
-        dados[nome_escolhido] = carteira
-        try:
-          salvar_dados_criptografados(dados, master_password)
-          print("Enderecos/metadados atualizados e salvos.")
-        except (ArquivoCorrompido, OSError) as e:
-          erro(f"falha ao salvar os metadados: {e}")
+        completo = carregar_dados_criptografados(master_password)
+        if completo is None:
+          erro("nao foi possivel reabrir o cofre para salvar os metadados.")
           input("\nPressione Enter para voltar ao menu principal...")
+        else:
+          try:
+            completo[nome_escolhido] = carteira
+            salvar_dados_criptografados(completo, master_password)
+            print("Enderecos/metadados atualizados e salvos.")
+          except (ArquivoCorrompido, OSError) as e:
+            erro(f"falha ao salvar os metadados: {e}")
+            input("\nPressione Enter para voltar ao menu principal...")
+          finally:
+            _apagar_dados_em_memoria(completo)
+      _apagar_carteira_em_memoria(carteira)
       # "0 - Voltar" no menu da carteira volta direto ao menu principal,
       # em vez de reabrir a lista de carteiras.
       return
@@ -3020,12 +3254,19 @@ def gerenciar_carteiras():
       ).strip().lower()
       if confirm != "s":
         continue
+      removida = dados.get(nome_escolhido)
+      _apagar_carteira_em_memoria(removida)
       try:
         del dados[nome_escolhido]
-        salvar_dados_criptografados(dados, master_password)
+        # Copia rasa para a gravacao: assim podemos apagar os segredos da
+        # copia em memoria sem alterar o que foi serializado.
+        restante = dict(dados)
+        salvar_dados_criptografados(restante, master_password)
         print("Carteira deletada com sucesso!")
       except (ArquivoCorrompido, OSError) as e:
         erro(f"falha ao salvar apos delecao: {e}")
+      finally:
+        restante = None
       input("Pressione Enter...")
 
 
@@ -3036,6 +3277,9 @@ def gerenciar_carteiras():
 
 def main():
   global ARQUIVO_CARTEIRAS
+
+  # Hardening: sem core dump e sem ptrace/leitura de /proc por terceiros.
+  _endurecer_processo()
 
   try:
     ARQUIVO_CARTEIRAS = resolver_arquivo_carteiras()
@@ -3085,6 +3329,7 @@ def main():
 
 
 if __name__ == "__main__":
+  _endurecer_processo()
   limpar_tela()
   print("=" * 56)
   print("  GELOWALLET = Gerenciador de Enderecos e Lock Offline")
@@ -3097,3 +3342,8 @@ if __name__ == "__main__":
     sys.exit(130)
   finally:
     liberar_trava_exclusiva()
+    # Best effort: coleta lixo, devolve paginas ao SO e limpa tela/scrollback.
+    # Segredos em str/bytes imutaveis nao podem ser zerados de forma garantida.
+    _liberar_heap()
+    _limpar_tela_ao_sair()
+    print("Sessao encerrada. Historico de tela limpo.")
