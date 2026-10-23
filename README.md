@@ -36,7 +36,8 @@ O GELOWALLET é uma ferramenta de linha de comando que:
 - **Guarda** tudo criptografado em um único arquivo local (`wallets.json`);
 - **Exibe** QR Code do endereço público e da chave privada (WIF);
 - **Consulta** saldo e número de transações de um endereço;
-- **Monta e assina** transações P2WPKH, exportando o HEX assinado e/ou um PSBT.
+- **Monta e assina** transações P2WPKH (HEX + PSBT) e P2PKH legado (HEX),
+  incluindo WIFs do BTC Puzzle (endereços `1...`).
 
 Ele foi pensado como um **cofre offline**: em vez de uma carteira online com
 transmissão automática, o GELOWALLET produz a transação assinada e deixa a
@@ -52,7 +53,10 @@ decisão de transmitir para você.
 - Seed de **12 palavras** na criação; aceita **12/24** ao importar (BIP39).
 - **Passphrase** BIP39 opcional.
 - Múltiplas contas (`m/84'/0'/conta'`) e múltiplos endereços por conta.
-- Importação de uma **WIF avulsa** e a salvamento como carteira própria.
+- Importação de uma **WIF avulsa** (P2WPKH) e salvamento como carteira própria.
+- Importação de **WIF P2PKH / BTC Puzzle** (comprimida, não comprimida ou hex
+  de 64 dígitos) como carteira separada, com endereço `1...` derivado
+  corretamente.
 
 ### Transações (P2WPKH / SegWit)
 - Montagem em perguntas simples: **origem → destino → valor → taxa**.
@@ -66,6 +70,17 @@ decisão de transmitir para você.
 - Salvaguardas: aviso de taxa excessiva, valor de destino abaixo do dust,
   UTXOs não confirmados ignorados por padrão.
 - Exportação do **HEX assinado** (`.hex`) e do **PSBT** não assinado (`.psbt`).
+
+### Transações P2PKH legado (BTC Puzzle)
+- Opção exclusiva para WIFs de endereços `1...`; não deriva `bc1q...`.
+- Aceita WIF comprimida (`K/L`), WIF não comprimida (`5`) e chave hex de
+  64 dígitos.
+- Assinatura **legacy** (sighash antigo), com estimativa de 148 vB por entrada
+  comprimida e 180 vB por entrada não comprimida.
+- Troco P2PKH com dust de 546 sats; por padrão, o troco volta para o próprio
+  endereço de origem.
+- **MAX** esvazia o endereço: usa todos os UTXOs e envia o saldo menos a taxa.
+- Gera apenas **HEX assinado** (sem PSBT) para transmissão manual.
 
 ### Segurança do cofre
 - **Argon2id** (memory-hard, 64 MiB) para derivar a chave da Senha Mestra.
@@ -134,10 +149,11 @@ Menu principal:
 2 - Carregar carteira existente (12/24 palavras + Passphrase)
 3 - Visualizar/Deletar/Transacionar carteiras cadastradas
 4 - Importar uma WIF (chave privada) e salvar como carteira
+5 - Importar WIF do BTC Puzzle (P2PKH legado, endereco 1...)
 0 - Sair
 ```
 
-Menu da carteira (após carregar):
+Menu da carteira P2WPKH (após carregar):
 
 ```
 Opcoes da Carteira:
@@ -146,6 +162,18 @@ Opcoes da Carteira:
 3 - Consultar saldo e transacoes do endereco
 4 - Criar transacao (enviar BTC)
 5 - Exportar todas as chaves (WIF) em texto
+0 - Voltar
+```
+
+Menu da carteira P2PKH (BTC Puzzle):
+
+```
+Opcoes da Carteira P2PKH:
+1 - Gerar QR Code do endereco publico
+2 - Gerar QR Code da chave privada (WIF)  [CUIDADO]
+3 - Consultar saldo e transacoes do endereco
+4 - Criar transacao (P2PKH legado)
+5 - Exportar a WIF em texto
 0 - Voltar
 ```
 
@@ -158,6 +186,8 @@ Opcoes da Carteira:
    Senha Mestra.
 3. **Reabrir** (opção 3): digite a Senha Mestra, escolha a carteira.
 4. **Enviar** (opção 4): informe origem, destino, valor e a taxa.
+   Para WIF P2PKH/BTC Puzzle, importe pela opção 5 do menu principal e use a
+   opção 4 do menu da carteira P2PKH (aceita `MAX` para esvaziar).
 5. **Transmitir**: copie o HEX gerado e transmita manualmente.
 
 ---
@@ -270,7 +300,8 @@ wallets.json      # cofre criptografado (gerado na 1ª gravação; permissão 06
 ## Perguntas frequentes
 
 **O programa transmite a transação?**
-Não. Ele gera o HEX assinado e um PSBT não assinado. A transmissão é manual.
+Não. Para P2WPKH ele gera o HEX assinado e um PSBT não assinado; para P2PKH
+legado gera apenas o HEX assinado. A transmissão é manual.
 
 **Onde estão meus fundos?**
 Na blockchain, sob o controle das chaves derivadas da sua seed. O GELOWALLET só
@@ -293,34 +324,21 @@ risco e teste primeiro com valores pequenos.
 ## Limitações
 
 - **Não transmite** transações.
-- Somente **P2WPKH** (endereços `bc1q...`); não faz Taproot (`bc1p`) nem multisig.
+- O fluxo principal é **P2WPKH** (`bc1q...`); a opção 5 cobre **P2PKH legado**
+  (`1...`, incluindo WIFs do BTC Puzzle). Não faz Taproot (`bc1p`) como origem
+  nem multisig.
 - Não acompanha saldos automaticamente (a consulta é por endereço).
 - **Não faz bumpfee** (apenas sinaliza RBF).
-- Gera PSBT, mas **não assina** PSBT de hardware (não integra Ledger/Trezor).
+- Gera PSBT para P2WPKH, mas **não assina** PSBT de hardware (não integra
+  Ledger/Trezor). O fluxo P2PKH gera apenas HEX.
 - Não é auditado por terceiros.
 
 ---
 
-## 📄 License
+## Licença
 
-This project is licensed under the MIT License.
+Defina aqui a licença do seu repositório (ex.: MIT).
 
-Copyright (c) 2026 Tadeu Cadilhe
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+```
+MIT License — ajuste conforme sua preferência.
+```

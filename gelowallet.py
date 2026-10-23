@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-gelowallet.py - Carteira Bitcoin BIP84 de terminal com montador de
-transacoes P2WPKH (baseado em darkwallet.py + utx0.py).
+gelowallet.py - Carteira Bitcoin de terminal BIP84 (P2WPKH), com suporte
+adicional a P2PKH legado (WIF do BTC Puzzle) e montador de transacoes
+(baseado em darkwallet.py + utx0.py).
 
 Melhorias em relacao aos dois scripts originais:
   - wallets.json gravado de forma ATOMICA (tmp + fsync + os.replace) e com
@@ -21,8 +22,13 @@ Melhorias em relacao aos dois scripts originais:
     trava de outra sessao.
   - A carteira e gravada ANTES de abrir o menu; antes, um Ctrl+C no meio do
     menu perdia a seed recem-gerada.
-  - WIF de chave NAO comprimida (formato antigo, "5...") e recusada: gasto
-    P2WPKH exige chave comprimida e a rede padrao rejeita pubkey de 65 bytes.
+  - No fluxo P2WPKH (opcao 4), WIF de chave NAO comprimida (formato antigo,
+    "5...") e recusada: gasto P2WPKH exige chave comprimida e a rede padrao
+    rejeita pubkey de 65 bytes.
+  - A opcao 5 (P2PKH legado / BTC Puzzle) aceita WIF comprimida, WIF nao
+    comprimida ou chave hex de 64 digitos, deriva o endereco 1... correto e
+    assina com sighash legacy. Esse fluxo gera apenas HEX assinado (sem PSBT)
+    e pode esvaziar o endereco com a opcao MAX.
   - Argon2id (memory-hard) para derivar a chave da Senha Mestra; arquivos
     antigos em PBKDF2 (600k iteracoes) continuam abrindo e sao migrados
     para Argon2id no proximo desbloqueio.
@@ -158,6 +164,8 @@ CONTA_PADRAO = 0
 #   arredondado para 294 (margem segura). A formula do comentario antigo
 #   (3 * (31 + 141) / 1000 * 3) estava errada; a constante estava certa.
 DUST_TROCO_P2WPKH = 294
+# Troco P2PKH legado (1...): 3000 sat/kvB * (34 + 148) / 1000 = 546 sats.
+DUST_TROCO_P2PKH = 546
 # Limite conservador para AVISAR sobre valor minimo do destino
 # (cobre P2PKH, que tem o maior dust da rede: 546 sats).
 DUST_DESTINO_AVISO = 546
@@ -1928,6 +1936,623 @@ def _vsize_real(raw_hex):
 
 
 # ==========================================================
+# P2PKH LEGADO / BTC PUZZLE
+# ==========================================================
+
+def motivo_wif_p2pkh_invalida(wif):
+  """Valida uma WIF mainnet para endereco P2PKH (comprimida ou nao)."""
+  if not isinstance(wif, str) or not wif:
+    return "WIF vazia."
+  try:
+    bruto = base58.b58decode_check(wif)
+  except Exception:
+    return "isso nao e uma WIF valida (base58/checksum)."
+  if len(bruto) not in (33, 34):
+    return "formato de WIF nao suportado (esperado mainnet)."
+  if bruto[0] != 0x80:
+    return "a WIF nao e da rede principal."
+  if len(bruto) == 34 and bruto[-1] != 0x01:
+    return "marcador de compressao da WIF invalido."
+  return None
+
+
+def chave_de_wif_ou_hex_puzzle(texto):
+  """Retorna (PrivateKey, descricao) para WIF P2PKH ou hex de 64 digitos."""
+  texto = texto.strip()
+  if re.fullmatch(r"(?:0x)?[0-9a-fA-F]{64}", texto):
+    hexlimpo = texto[2:] if texto.lower().startswith("0x") else texto
+    segredo = int(hexlimpo, 16)
+    if not 1 <= segredo < ecdsa.SECP256k1.order:
+      return None, "a chave hexadecimal esta fora do intervalo valido."
+    return ec.PrivateKey(segredo.to_bytes(32, "big"), compressed=True), (
+        "hex de 64 digitos (comprimido)"
+    )
+
+  motivo = motivo_wif_p2pkh_invalida(texto)
+  if motivo is not None:
+    return None, motivo
+  try:
+    chave = ec.PrivateKey.from_wif(texto)
+  except Exception as e:
+    return None, f"WIF invalida: {e}"
+  descricao = "WIF comprimida" if chave.compressed else "WIF nao comprimida"
+  return chave, descricao
+
+
+def _meta_p2pkh_da_carteira(carteira):
+  metadados = carteira.get("metadados")
+  if not isinstance(metadados, dict):
+    return None
+  enderecos = metadados.get("enderecos")
+  if not isinstance(enderecos, dict):
+    return None
+  for meta in enderecos.values():
+    if (
+        isinstance(meta, dict)
+        and meta.get("tipo") == "p2pkh"
+        and meta.get("endereco")
+        and meta.get("wif")
+    ):
+      return meta
+  return None
+
+
+def _vbytes_entrada_p2pkh(comprimida):
+  """P2PKH comprimida ~148 vB; nao comprimida ~180 vB."""
+  return 148 if comprimida else 180
+
+
+def estimar_vsize_p2pkh(input_count, output_scripts, entrada_vbytes=148):
+  """Estima vsize de uma transacao P2PKH legada (sem witness)."""
+  return int(math.ceil(
+      10 + entrada_vbytes * input_count
+      + sum(output_vbytes(s) for s in output_scripts)
+  ))
+
+
+def estimar_taxa_p2pkh(
+    input_count, output_scripts, entrada_vbytes, fee_rate
+):
+  vsize = estimar_vsize_p2pkh(
+      input_count, output_scripts, entrada_vbytes
+  )
+  return math.ceil(vsize * fee_rate), vsize
+
+
+def montar_entradas_p2pkh(
+    utxos, valor, taxa_vb, spk_destino, spk_troco, spk_origem,
+    entrada_vbytes
+):
+  """Seleciona UTXOs P2PKH (maior primeiro) para valor + taxa + troco."""
+  entradas = []
+  total = 0
+  scripts_pior_caso = [spk_destino, spk_troco]
+  for utxo in sorted(utxos, key=lambda u: u["value"], reverse=True):
+    entradas.append(
+        {
+            "txid": utxo["txid"],
+            "vout": utxo["vout"],
+            "value": utxo["value"],
+            "scriptPubKey": spk_origem,
+        }
+    )
+    total += utxo["value"]
+    taxa_com_troco, _ = estimar_taxa_p2pkh(
+        len(entradas), scripts_pior_caso, entrada_vbytes, taxa_vb
+    )
+    if total >= valor + taxa_com_troco + DUST_TROCO_P2PKH:
+      break
+  return entradas, total
+
+
+def _assinar_e_serializar_p2pkh(
+    entradas, saidas, chave, pub, spk_origem
+):
+  """Assina cada entrada P2PKH legada e devolve (tx, raw_hex)."""
+  entradas_tx = [
+      transaction.TransactionInput(
+          txid=item["txid"], vout=item["vout"], sequence=SEQUENCE_RBF
+      )
+      for item in entradas
+  ]
+  tx = transaction.Transaction(vin=entradas_tx, vout=saidas)
+  for i in range(len(entradas)):
+    sighash = tx.sighash_legacy(
+        i, spk_origem, sighash=transaction.SIGHASH.ALL
+    )
+    assinatura = chave.sign(sighash)
+    entradas_tx[i].script_sig = script.script_sig_p2pkh(
+        assinatura, pub, transaction.SIGHASH.ALL
+    )
+  return tx, tx.serialize().hex()
+
+
+def _confirmar_taxa_alta_p2pkh(valor, taxa_calculada):
+  """Mesma salvaguarda de taxa do fluxo P2WPKH, sem alterar aquele fluxo."""
+  teto_percentual = int(valor * FRACAO_MAX_TAXA)
+  if (
+      taxa_calculada > teto_percentual
+      or taxa_calculada > TAXA_MINIMA_ABSOLUTA
+  ):
+    percentual = 100 * taxa_calculada / valor
+    motivos = []
+    if taxa_calculada > teto_percentual:
+      motivos.append(f"{percentual:.1f}% do valor enviado")
+    if taxa_calculada > TAXA_MINIMA_ABSOLUTA:
+      motivos.append(f"acima de {TAXA_MINIMA_ABSOLUTA} sats")
+    print(
+        f"\nATENCAO: a taxa ({taxa_calculada} sats) e alta "
+        f"({'; '.join(motivos)})."
+    )
+    conf = input('Digite "TAXA ALTA" para prosseguir: ').strip().upper()
+    return conf == "TAXA ALTA"
+  return True
+
+
+def criar_transacao_p2pkh(carteira):
+  """Cria e assina uma transacao gastando um endereco P2PKH legado.
+
+  Serve para WIFs do BTC Puzzle (enderecos 1...) e outras chaves P2PKH.
+  Nao transmite: imprime o HEX assinado e oferece salvar em arquivo.
+  """
+  meta = _meta_p2pkh_da_carteira(carteira)
+  if meta is None:
+    erro("esta carteira nao tem uma WIF P2PKH valida.")
+    return
+
+  endereco_origem = meta["endereco"]
+  wif = meta["wif"]
+  motivo = motivo_wif_p2pkh_invalida(wif)
+  if motivo is not None:
+    erro(f"a WIF salva nesta carteira e invalida:\n{motivo}")
+    return
+  try:
+    chave = ec.PrivateKey.from_wif(wif)
+    pub = chave.get_public_key()
+    spk_origem = script.p2pkh(pub)
+  except Exception as e:
+    erro(f"falha ao processar a WIF: {e}")
+    return
+  if spk_origem.address().lower() != endereco_origem.lower():
+    erro("seguranca: a WIF nao corresponde ao endereco P2PKH salvo.")
+    return
+
+  entrada_vbytes = _vbytes_entrada_p2pkh(chave.compressed)
+  print("\n=== CRIAR TRANSACAO P2PKH (BTC PUZZLE) ===")
+  print(f"Origem P2PKH: {endereco_origem}")
+  print(
+      "Tipo de chave: "
+      + ("comprimida" if chave.compressed else "nao comprimida")
+  )
+
+  endereco_destino = input("\nEndereco de destino: ").strip()
+  if not endereco_destino:
+    erro("o endereco de destino nao pode ficar vazio.")
+    return
+  if not eh_endereco_mainnet(endereco_destino):
+    erro("o endereco de destino nao parece ser da rede principal.")
+    return
+  try:
+    spk_destino = script.address_to_scriptpubkey(endereco_destino)
+  except Exception as e:
+    erro(f"endereco de destino invalido: {e}")
+    return
+
+  bruto = input(
+      "Valor a enviar em satoshis (ou MAX para esvaziar): "
+  ).strip().replace(",", ".")
+  enviar_tudo = bruto.upper() == "MAX"
+  valor = None
+  if not enviar_tudo:
+    try:
+      valor = int(bruto)
+    except ValueError:
+      erro("o valor deve ser um numero inteiro de satoshis ou MAX.")
+      return
+    if valor <= 0:
+      erro("o valor deve ser um inteiro positivo.")
+      return
+    if valor > MAX_MONEY_SATS:
+      erro("o valor excede o limite de dinheiro existente no Bitcoin.")
+      return
+    if valor < DUST_DESTINO_AVISO:
+      print(
+          f"\nATENCAO: {valor} sats e inferior ao dust conservador "
+          f"({DUST_DESTINO_AVISO} sats). A rede pode REJEITAR a transacao."
+      )
+      conf = input(
+          'Digite "CONFIRMAR" para prosseguir assim: '
+      ).strip().upper()
+      if conf != "CONFIRMAR":
+        print("Operacao cancelada.")
+        return
+
+  endereco_troco = None
+  spk_troco = None
+  if not enviar_tudo:
+    endereco_troco = endereco_origem
+    print(
+        f"\nTroco voltara para o proprio endereco de origem:"
+        f"\n  {endereco_troco}"
+    )
+    troco_informado = input(
+        "Outro endereco de troco (Enter = o da origem): "
+    ).strip()
+    if troco_informado:
+      endereco_troco = troco_informado
+    if not eh_endereco_mainnet(endereco_troco):
+      erro("o endereco de troco nao parece ser da rede principal.")
+      return
+    try:
+      spk_troco = script.address_to_scriptpubkey(endereco_troco)
+    except Exception as e:
+      erro(f"endereco de troco invalido: {e}")
+      return
+    if endereco_destino == endereco_troco:
+      print(
+          "\nAVISO: destino igual ao endereco de troco; o troco se juntara"
+          " ao valor enviado no mesmo endereco."
+      )
+
+  incluir_nc = input(
+      "Incluir UTXOs ainda nao confirmados? (s/N): "
+  ).strip().lower() == "s"
+
+  utxos = obter_utxos(
+      endereco_origem, incluir_nao_confirmados=incluir_nc
+  )
+  if utxos is None:
+    return
+  if not utxos:
+    erro("nenhum UTXO encontrado no endereco P2PKH de origem.")
+    return
+  total_disponivel = sum(u["value"] for u in utxos)
+  print(f"\nSaldo disponivel nessa origem: {total_disponivel} sats.")
+
+  taxa_vb = escolher_taxa()
+  if taxa_vb is None:
+    return
+
+  if enviar_tudo:
+    entradas = [
+        {
+            "txid": u["txid"],
+            "vout": u["vout"],
+            "value": u["value"],
+            "scriptPubKey": spk_origem,
+        }
+        for u in utxos
+    ]
+    total_entradas = total_disponivel
+    taxa_calculada, vsize_final = estimar_taxa_p2pkh(
+        len(entradas), [spk_destino], entrada_vbytes, taxa_vb
+    )
+    valor = total_entradas - taxa_calculada
+    if valor <= 0:
+      erro(
+          "o saldo nao cobre a taxa estimada para esvaziar o endereco."
+      )
+      return
+    if valor < DUST_DESTINO_AVISO:
+      erro(
+          f"sobrariam {valor} sats depois da taxa, abaixo do dust "
+          f"({DUST_DESTINO_AVISO} sats). Nao ha como esvaziar."
+      )
+      return
+    valor_troco = 0
+    tem_troco = False
+    saidas = [
+        transaction.TransactionOutput(
+            value=valor, script_pubkey=spk_destino
+        ),
+    ]
+  else:
+    entradas, total_entradas = montar_entradas_p2pkh(
+        utxos, valor, taxa_vb, spk_destino, spk_troco, spk_origem,
+        entrada_vbytes
+    )
+    taxa_um_output, vsize_um = estimar_taxa_p2pkh(
+        len(entradas), [spk_destino], entrada_vbytes, taxa_vb
+    )
+    taxa_dois_outputs, vsize_dois = estimar_taxa_p2pkh(
+        len(entradas), [spk_destino, spk_troco], entrada_vbytes, taxa_vb
+    )
+    if total_entradas < valor + taxa_um_output:
+      erro(
+          "saldo insuficiente.\n"
+          f"  Entradas: {total_entradas} sats\n"
+          f"  Valor:    {valor} sats\n"
+          f"  Taxa:     {taxa_um_output} sats (1 output)"
+      )
+      return
+
+    troco_potencial = total_entradas - valor - taxa_dois_outputs
+    if troco_potencial >= DUST_TROCO_P2PKH:
+      valor_troco = troco_potencial
+      taxa_calculada = taxa_dois_outputs
+      vsize_final = vsize_dois
+      tem_troco = True
+      saidas = [
+          transaction.TransactionOutput(
+              value=valor, script_pubkey=spk_destino
+          ),
+          transaction.TransactionOutput(
+              value=valor_troco, script_pubkey=spk_troco
+          ),
+      ]
+    else:
+      valor_troco = 0
+      taxa_calculada = total_entradas - valor
+      vsize_final = vsize_um
+      tem_troco = False
+      if taxa_calculada < taxa_um_output:
+        erro("o saldo nao cobre a taxa estimada.")
+        return
+      saidas = [
+          transaction.TransactionOutput(
+              value=valor, script_pubkey=spk_destino
+          ),
+      ]
+
+  taxa_efetiva = taxa_calculada / vsize_final
+  if not _confirmar_taxa_alta_p2pkh(valor, taxa_calculada):
+    print("Operacao cancelada.")
+    return
+
+  print("\n" + "=" * 64)
+  print("RESUMO DA TRANSACAO P2PKH")
+  print("=" * 64)
+  print(f"Origem              : {endereco_origem}")
+  print(
+      f"Entradas utilizadas : {len(entradas)} de {len(utxos)} UTXO(s)"
+  )
+  print(f"Total das entradas  : {total_entradas} sats")
+  print(f"Valor para destino  : {valor} sats ({endereco_destino})")
+  print(f"Taxa total estimada : {taxa_calculada} sats")
+  print(f"Taxa efetiva aprox. : {taxa_efetiva:.2f} sat/vB")
+  print(f"Tamanho estimado    : {vsize_final} vB")
+  if tem_troco:
+    print(f"Valor do troco      : {valor_troco} sats ({endereco_troco})")
+  else:
+    print("Valor do troco      : (sem saida de troco)")
+    if enviar_tudo:
+      print("  Motivo: voce pediu para esvaziar o endereco (MAX).")
+    elif troco_potencial > 0:
+      print(
+          f"  Motivo: o troco calculado ({troco_potencial} sats) ficou"
+          f"\n  abaixo do minimo de {DUST_TROCO_P2PKH} sats (dust P2PKH)."
+          "\n  Esse valor foi somado a taxa."
+      )
+  print("RBF                 : sinalizado")
+  print("=" * 64)
+
+  conf = input(
+      "\nPara assinar e gerar o HEX, digite SIM: "
+  ).strip()
+  if conf != "SIM":
+    print("Operacao cancelada.")
+    return
+
+  try:
+    _, raw_hex = _assinar_e_serializar_p2pkh(
+        entradas, saidas, chave, pub, spk_origem
+    )
+  except Exception as e:
+    erro(f"erro ao assinar a transacao P2PKH: {e}")
+    return
+
+  vsize_real = _vsize_real(raw_hex)
+  print("\n" + "=" * 64)
+  print("TRANSACAO P2PKH ASSINADA - NAO TRANSMITIDA")
+  print("=" * 64)
+  print(f"Taxa total       : {taxa_calculada} sats")
+  print(
+      f"Tamanho real     : {vsize_real} vB (estimado: {vsize_final} vB)"
+  )
+  print(
+      f"Taxa efetiva real: {taxa_calculada / vsize_real:.2f} sat/vB"
+  )
+  print("\nRAW HEX:")
+  print(raw_hex)
+  print("=" * 64)
+  print(
+      "\nA transacao NAO foi transmitida. Confira o HEX, os valores e os"
+      "\nenderecos antes de fazer o broadcast."
+  )
+
+  if input("\nSalvar o HEX em arquivo? (s/N): ").strip().lower() == "s":
+    salvar_conteudo_em_arquivo(
+        "transacao_p2pkh.hex", raw_hex + "\n", "o HEX assinado"
+    )
+
+
+def menu_carteira_p2pkh(carteira):
+  """Menu de uma carteira P2PKH (BTC Puzzle), sem alterar o menu P2WPKH."""
+  meta = _meta_p2pkh_da_carteira(carteira)
+  if meta is None:
+    erro("esta carteira nao tem uma WIF P2PKH valida.")
+    return
+
+  endereco = meta["endereco"]
+  wif = meta["wif"]
+  try:
+    chave = ec.PrivateKey.from_wif(wif)
+  except Exception as e:
+    erro(f"a WIF salva nesta carteira e invalida: {e}")
+    return
+  if script.p2pkh(chave.get_public_key()).address().lower() != endereco.lower():
+    erro("seguranca: a WIF nao corresponde ao endereco P2PKH salvo.")
+    return
+
+  print("\n=== CARTEIRA BTC PUZZLE / P2PKH LEGADO ===")
+  print(f"Endereco P2PKH: {endereco}")
+  print(
+      "Tipo de chave: "
+      + ("comprimida" if chave.compressed else "nao comprimida")
+  )
+  print(
+      "Esta carteira gerencia somente este endereco P2PKH (1...)."
+  )
+  print("Transacoes deste menu geram apenas HEX assinado (sem PSBT).")
+  if not chave.compressed:
+    print(
+        "Aviso: a WIF e nao comprimida. Os puzzles classicos usam chave"
+        "\ncomprimida; confira se o endereco acima e realmente o seu."
+    )
+  if USANDO_API_PUBLICA:
+    print(
+        "\nPRIVACIDADE: as consultas de saldo vao para mempool.space, que VE"
+        "\nos enderecos consultados. Para um node proprio/Tor, use"
+        "\nGELOWALLET_API."
+    )
+
+  while True:
+    print("\nOpcoes da Carteira P2PKH:")
+    print("1 - Gerar QR Code do endereco publico")
+    print("2 - Gerar QR Code da chave privada (WIF)  [CUIDADO]")
+    print("3 - Consultar saldo e transacoes do endereco")
+    print("4 - Criar transacao (P2PKH legado)")
+    print("5 - Exportar a WIF em texto")
+    print("0 - Voltar ao menu principal")
+
+    esc = input("Escolha: ").strip()
+    if esc == "0":
+      break
+    if esc == "1":
+      exibir_qr_code(endereco)
+    elif esc == "2":
+      exibir_chave_privada({"publico": endereco, "privado": wif})
+    elif esc == "3":
+      consultar_saldo_endereco(endereco)
+    elif esc == "4":
+      criar_transacao_p2pkh(carteira)
+    elif esc == "5":
+      print(
+          "\nATENCAO: a WIF abaixo da controle total dos fundos deste"
+          "\nendereco. Nao faca captura de tela nem compartilhe."
+      )
+      conf = input(
+          'Digite "EXPORTAR" para exibir a WIF: '
+      ).strip().upper()
+      if conf == "EXPORTAR":
+        print(f"\nWIF: {wif}")
+    else:
+      erro("opcao incorreta. Digite 1, 2, 3, 4, 5 ou 0.")
+
+
+def importar_wif_puzzle_como_carteira():
+  """Importa uma WIF P2PKH (BTC Puzzle) como uma carteira separada.
+
+  Aceita WIF comprimida (K/L), WIF nao comprimida (5) e chave hex de 64
+  digitos. O endereco gerado e P2PKH (1...), nao P2WPKH (bc1q...).
+  """
+  limpar_tela()
+  print("=== 5. IMPORTAR WIF DO BTC PUZZLE (P2PKH LEGADO) ===")
+  print(
+      "Aceita WIF comprimida (K/L), WIF nao comprimida (5) ou chave"
+      "\nhexadecimal de 64 digitos. O endereco gerado sera P2PKH (1...)."
+  )
+  print(
+      "\nEsta opcao e separada da opcao 4: ela NAO cria endereco bc1q."
+  )
+  texto = getpass.getpass(
+      "\nDigite a WIF do BTC Puzzle (ou hex, sem eco): "
+  ).strip()
+  if not texto:
+    erro("nenhuma WIF informada.")
+    input("\nPressione Enter para voltar...")
+    return
+
+  chave, descricao = chave_de_wif_ou_hex_puzzle(texto)
+  if chave is None:
+    erro(descricao)
+    input("\nPressione Enter para voltar...")
+    return
+
+  endereco = script.p2pkh(chave.get_public_key()).address()
+  wif = chave.wif()
+  print(f"\nEndereco P2PKH (1...):\n  {endereco}")
+  print(f"Tipo de chave: {descricao}")
+  if not chave.compressed:
+    print(
+        "\nAviso: a WIF e nao comprimida. Os puzzles classicos usam chave"
+        "\ncomprimida; confira se o endereco acima e o endereco do puzzle."
+    )
+  print(
+      "\nEsta carteira vai gerenciar somente esse endereco P2PKH. Se os"
+      "\nfundos estiverem em outro endereco, eles nao aparecerao aqui."
+  )
+  conf = input(
+      "\nSalvar esta WIF como uma carteira P2PKH? (s/n): "
+  ).strip().lower()
+  if conf != "s":
+    print("Operacao cancelada.")
+    input("\nPressione Enter para voltar...")
+    return
+
+  try:
+    dados, master_password = obter_dados_e_autenticar()
+  except ArquivoCorrompido as e:
+    erro(
+        f"{ARQUIVO_CARTEIRAS} esta corrompido ({e}). A WIF NAO foi salva."
+        " Remova ou renomeie o arquivo para recomecar."
+    )
+    input("\nPressione Enter para voltar...")
+    return
+
+  nome = input("\nDigite um nome/alias para esta carteira: ").strip()
+  if not nome:
+    print("Nome vazio; WIF nao salva.")
+    input("\nPressione Enter para voltar...")
+    return
+  if nome in dados:
+    conf = input(
+        f"Ja existe uma carteira com o nome '{nome}'.\n"
+        'Digite "SUBSTITUIR" para sobrescrever: '
+    ).strip().upper()
+    if conf != "SUBSTITUIR":
+      print("Operacao cancelada; a carteira existente foi preservada.")
+      input("\nPressione Enter para voltar...")
+      return
+
+  metadados = {
+      "contas": [CONTA_PADRAO],
+      "enderecos": {
+          "0/0/0": {
+              "endereco": endereco,
+              "wif": wif,
+              "tipo": "p2pkh",
+              "natureza": "ext",
+              "conta": CONTA_PADRAO,
+              "index": 0,
+              "fingerprint": "00000000",
+              "comprimida": chave.compressed,
+          }
+      },
+  }
+  dados[nome] = {
+      "tipo": "p2pkh",
+      "mnemonic": "",
+      "passphrase": "",
+      "metadados": metadados,
+  }
+  try:
+    salvar_dados_criptografados(dados, master_password)
+  except (ArquivoCorrompido, OSError) as e:
+    erro(
+        f"falha ao salvar a carteira P2PKH ({e}). A chave NAO foi gravada."
+    )
+    input("\nPressione Enter para voltar...")
+    return
+
+  print(
+      f"\nCarteira P2PKH '{nome}' salva. Abra-a pelo menu principal"
+      "\n(opcao 3) para gerar QR, consultar saldo ou transacionar."
+  )
+  input("\nPressione Enter para voltar...")
+
+
+# ==========================================================
 # MENU DA CARTEIRA
 # ==========================================================
 
@@ -2361,6 +2986,9 @@ def gerenciar_carteiras():
     nome_escolhido = nomes[idx]
     if esc == "L":
       carteira = dados[nome_escolhido]
+      if carteira.get("tipo") == "p2pkh":
+        menu_carteira_p2pkh(carteira)
+        return
       metadados = carteira.get("metadados")
       if metadados is None:
         metadados = {"contas": [CONTA_PADRAO], "enderecos": {}}
@@ -2434,6 +3062,7 @@ def main():
     print("2 - Carregar carteira existente (12/24 palavras + Passphrase)")
     print("3 - Visualizar/Deletar/Transacionar carteiras cadastradas")
     print("4 - Importar uma WIF (chave privada) e salvar como carteira")
+    print("5 - Importar WIF do BTC Puzzle (P2PKH legado, endereco 1...)")
     print("0 - Sair")
     print("=" * 56)
 
@@ -2447,6 +3076,8 @@ def main():
       gerenciar_carteiras()
     elif esc == "4":
       importar_wif_como_carteira()
+    elif esc == "5":
+      importar_wif_puzzle_como_carteira()
     elif esc == "0":
       limpar_tela()
       print("Saindo...")
