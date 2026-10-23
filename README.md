@@ -72,7 +72,7 @@ decisão de transmitir para você.
 - **Migração automática** de arquivos antigos em PBKDF2 (600k iterações).
 - Escrita **atômica** do arquivo (tmp + fsync + `os.replace`), com permissão `0600`.
 - Senha Mestra com mínimo de **12 caracteres** e aviso de senha fraca.
-- Mnemonic e WIF digitados **sem eco** (`getpass`).
+- Senha Mestra digitada com **eco mascarado** (`*` por caractere); o mnemonic, a passphrase e a WIF continuam **sem eco** (`getpass`).
 - Detecção clara de arquivo corrompido × senha incorreta.
 
 ---

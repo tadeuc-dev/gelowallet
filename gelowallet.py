@@ -8,11 +8,25 @@ Melhorias em relacao aos dois scripts originais:
   - wallets.json gravado de forma ATOMICA (tmp + fsync + os.replace) e com
     permissao 0600 (antes ficava 0644, legivel por outros usuarios).
     O diretorio tambem e sincronizado (fsync) apos o replace.
+  - Formato do cofre versionado: os parametros do KDF ficam GRAVADOS no
+    arquivo (v2). Mudar as constantes ARGON2_* no codigo nao invalida cofres
+    antigos: o formato v1 usa uma copia congelada dos parametros originais.
+  - O cofre e localizado independentemente do diretorio atual (variavel
+    GELOWALLET_VAULT > pasta do script > diretorio atual >
+    ~/.local/share/gelowallet). Se houver mais de um wallets.json, aborta em
+    vez de abrir o errado.
+  - Trava exclusiva (flock) impede duas instancias simultaneas de usar o
+    mesmo cofre (antes, a ultima a salvar apagava as alteracoes da outra).
+  - A carteira e gravada ANTES de abrir o menu; antes, um Ctrl+C no meio do
+    menu perdia a seed recem-gerada.
+  - WIF de chave NAO comprimida (formato antigo, "5...") e recusada: gasto
+    P2WPKH exige chave comprimida e a rede padrao rejeita pubkey de 65 bytes.
   - Argon2id (memory-hard) para derivar a chave da Senha Mestra; arquivos
     antigos em PBKDF2 (600k iteracoes) continuam abrindo e sao migrados
-    para Argon2id na proxima gravacao.
-  - Senha mestra exige minimo de 12 caracteres (avisa se parecer fraca);
-    passphrase e mnemonic digitados com getpass (sem aparecer na tela nem
+    para Argon2id no proximo desbloqueio.
+  - Senha mestra exige minimo de 12 caracteres (avisa se parecer fraca).
+    A Senha Mestra e digitada com eco mascarado ("*" por caractere); o
+    mnemonic e a passphrase continuam com getpass (sem aparecer na tela nem
     no historico).
   - Mnemonic so e exibido na criacao/importacao (nao ao carregar carteira).
   - Arquivo corrompido detectado e reportado com clareza; quando a senha
@@ -42,6 +56,7 @@ consultados; use GELOWALLET_API para apontar a um node proprio ou via Tor.
 """
 
 import base64
+import codecs
 import getpass
 import hashlib
 import hmac
@@ -49,8 +64,21 @@ import json
 import math
 import os
 import re
+import select
 import sys
 import tempfile
+
+try:
+  import fcntl  # POSIX: trava exclusiva do cofre
+except ImportError:  # Windows
+  fcntl = None
+
+try:
+  import termios  # POSIX: leitura de senha com eco mascarado
+  import tty
+except ImportError:  # Windows
+  termios = None
+  tty = None
 
 import base58
 import bech32
@@ -70,7 +98,12 @@ from embit import ec, psbt, script, transaction
 # CONFIGURACAO GERAL
 # ==========================================================
 
-ARQUIVO_CARTEIRAS = "wallets.json"
+# O cofre NAO e relativo ao diretorio atual: main() resolve o caminho real
+# com resolver_arquivo_carteiras(). Este valor e apenas o fallback (pasta do
+# script), para que chamadas fora de main() continuem funcionando.
+ARQUIVO_CARTEIRAS = os.path.join(
+    os.path.dirname(os.path.realpath(__file__)), "wallets.json"
+)
 
 # Derivacao de chave da Senha Mestra.
 # Padrao atual: Argon2id (memory-hard), resistente a ataque offline por GPU
@@ -83,8 +116,18 @@ ARGON2_MEMORIA_KIB = 64 * 1024  # 64 MiB
 
 # Formato antigo (PBKDF2), mantido apenas para ABRIR arquivos ja existentes.
 # Arquivos com este KDF sao migrados para Argon2id ao serem abertos.
-ITERACOES_PBKDF2 = 600_000
 KDF_LEGADO = "pbkdf2-sha256"
+
+# Versao do formato do cofre:
+#   v1 = parametros de KDF implicitos no codigo (arquivos antigos);
+#   v2 = parametros gravados no proprio arquivo, campo "kdf_params".
+VERSAO_FORMATO_COFRE = 2
+
+# Parametros CONGELADOS do formato v1 (gravados quando os parametros ainda
+# nao iam para o arquivo). NUNCA altere estes valores: eles sao a unica forma
+# de reabrir cofres antigos depois que as constantes "atuais" acima mudarem.
+ARGON2_PARAMS_FORMATO_1 = {"iterations": 3, "lanes": 4, "memory_cost": 65536}
+PBKDF2_PARAMS_FORMATO_1 = {"iterations": 600_000}
 
 TAMANHO_SALT = 16
 # Piso de senha: 12 caracteres (mais entropia contra forca bruta offline).
@@ -149,6 +192,113 @@ def limpar_tela():
 
 
 # ==========================================================
+# LOCALIZACAO DO COFRE E TRAVA DE INSTANCIA UNICA
+# ==========================================================
+
+
+def _caminhos_candidatos_cofre():
+  """Caminhos onde um cofre existente pode estar, em ordem de preferencia."""
+  pasta_script = os.path.dirname(os.path.realpath(__file__))
+  pasta_xdg = os.path.join(
+      os.path.expanduser("~"), ".local", "share", "gelowallet"
+  )
+  candidatos = [
+      os.path.join(pasta_script, "wallets.json"),
+      os.path.join(os.getcwd(), "wallets.json"),
+      os.path.join(pasta_xdg, "wallets.json"),
+  ]
+  vistos = set()
+  unicos = []
+  for caminho in candidatos:
+    caminho = os.path.abspath(caminho)
+    if caminho not in vistos:
+      vistos.add(caminho)
+      unicos.append(caminho)
+  return unicos
+
+
+def resolver_arquivo_carteiras():
+  """Decide QUAL wallets.json usar, sem depender do diretorio atual.
+
+  Ordem: GELOWALLET_VAULT > pasta do script > diretorio atual > XDG.
+  Se mais de um cofre existir, aborta: escolher o errado silenciosamente e
+  o mesmo que "sumir" com as carteiras do usuario.
+  """
+  env = os.environ.get("GELOWALLET_VAULT")
+  if env:
+    return os.path.abspath(os.path.expanduser(env))
+
+  candidatos = _caminhos_candidatos_cofre()
+  existentes = [c for c in candidatos if os.path.exists(c)]
+  if len(existentes) > 1:
+    raise RuntimeError(
+        "mais de um wallets.json encontrado:\n  "
+        + "\n  ".join(existentes)
+        + "\n\nEscolha qual usar antes de continuar:\n"
+        "  GELOWALLET_VAULT=/caminho/para/wallets.json python3 gelowallet.py"
+    )
+  if existentes:
+    return existentes[0]
+
+  padrao = candidatos[-1]
+  print("\nNenhum cofre (wallets.json) existente foi encontrado.")
+  print("Caminhos verificados:")
+  for caminho in candidatos:
+    print(f"  - {caminho}")
+  print(
+      "\nIsso e esperado na primeira execucao. Se voce JA tinha um cofre em\n"
+      "outro lugar, NAO continue: cancele e aponte para ele com\n"
+      "GELOWALLET_VAULT=/caminho/para/wallets.json"
+  )
+  conf = input(f"\nCriar um NOVO cofre em:\n  {padrao}\n? (s/n): ").strip().lower()
+  if conf != "s":
+    raise RuntimeError(
+        "nenhum cofre selecionado. Use "
+        "GELOWALLET_VAULT=/caminho/para/wallets.json"
+    )
+  return padrao
+
+
+_trava_cofre = None
+
+
+def adquirir_trava_exclusiva():
+  """Impede duas instancias simultaneas de mexer no mesmo cofre.
+
+  Retorna None em caso de sucesso ou uma mensagem de erro. Usa um arquivo
+  .lock separado porque a gravacao atomica troca o inode do wallets.json
+  (travar o proprio arquivo nao funcionaria).
+  """
+  global _trava_cofre
+  if fcntl is None:
+    print(
+        "Aviso: trava de instancia unica indisponivel nesta plataforma."
+    )
+    return None
+
+  caminho = ARQUIVO_CARTEIRAS + ".lock"
+  try:
+    arquivo = open(caminho, "a+")
+  except OSError as e:
+    return f"nao foi possivel criar a trava {caminho}: {e}"
+  try:
+    fcntl.flock(arquivo.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+  except OSError:
+    arquivo.close()
+    return (
+        "outra instancia do GELOWALLET ja esta aberta com este cofre:\n"
+        f"  {ARQUIVO_CARTEIRAS}\n"
+        "Feche a outra sessao antes de continuar."
+    )
+  try:
+    os.chmod(caminho, 0o600)
+  except OSError:
+    pass
+  _trava_cofre = arquivo
+  return None
+
+
+# ==========================================================
 # CRIPTOGRAFIA E ARMAZENAMENTO SEGURO
 # ==========================================================
 
@@ -159,29 +309,82 @@ def ripemd160(data: bytes) -> bytes:
   return h.digest()
 
 
-def gerar_chave_fernet(master_password: str, salt: bytes, kdf=None) -> bytes:
+def _parametros_kdf_atuais():
+  """Parametros de KDF usados ao GRAVAR um cofre (formato atual)."""
+  return {
+      "iterations": ARGON2_ITERACOES,
+      "lanes": ARGON2_LANES,
+      "memory_cost": ARGON2_MEMORIA_KIB,
+  }
+
+
+def _parametros_kdf_formato_1(kdf):
+  """Parametros implicitos dos cofres gravados antes do versionamento."""
+  if kdf == KDF_LEGADO:
+    return dict(PBKDF2_PARAMS_FORMATO_1)
+  return dict(ARGON2_PARAMS_FORMATO_1)
+
+
+def _validar_parametros_kdf(kdf, params):
+  """Valida parametros lidos do arquivo (evita CPU/RAM absurdas).
+
+  Sem isso, um arquivo adulterado poderia pedir Argon2id com gigabytes de
+  memoria e derrubar a maquina antes mesmo de a senha ser conferida.
+  """
+  if not isinstance(params, dict):
+    raise ArquivoCorrompido("campo 'kdf_params' invalido.")
+  try:
+    iteracoes = int(params["iterations"])
+    if kdf == KDF_LEGADO:
+      if not 1 <= iteracoes <= 10_000_000:
+        raise ValueError
+      return {"iterations": iteracoes}
+    lanes = int(params["lanes"])
+    memoria = int(params["memory_cost"])
+  except (KeyError, TypeError, ValueError):
+    raise ArquivoCorrompido(
+        "parametros de KDF ausentes ou invalidos no cofre."
+    )
+  if not 1 <= iteracoes <= 32:
+    raise ArquivoCorrompido("iteracoes do Argon2id fora do limite seguro.")
+  if not 1 <= lanes <= 16:
+    raise ArquivoCorrompido("lanes do Argon2id fora do limite seguro.")
+  if not 8 * 1024 <= memoria <= 1024 * 1024:
+    raise ArquivoCorrompido("memoria do Argon2id fora do limite seguro.")
+  return {"iterations": iteracoes, "lanes": lanes, "memory_cost": memoria}
+
+
+def gerar_chave_fernet(master_password: str, salt: bytes, kdf=None, params=None):
   """Deriva a chave Fernet a partir da Senha Mestra.
 
-  kdf=None usa o padrao atual (Argon2id). Para abrir arquivos antigos,
-  informe kdf="pbkdf2-sha256" (formato legado).
+  Ao ABRIR um cofre, kdf/params devem vir do proprio arquivo. Sem argumentos,
+  usa o formato atual (Argon2id com as constantes do codigo).
   """
+  if kdf is None:
+    kdf = KDF_ATUAL
+  if params is None:
+    params = _parametros_kdf_atuais()
+  senha = master_password.encode()
+
   if kdf == KDF_LEGADO:
     derivador = PBKDF2HMAC(
         algorithm=hashes.SHA256(),
         length=32,
         salt=salt,
-        iterations=ITERACOES_PBKDF2,
+        iterations=int(params["iterations"]),
     )
-    chave = derivador.derive(master_password.encode())
-  else:
+    chave = derivador.derive(senha)
+  elif kdf == KDF_ATUAL:
     derivador = Argon2id(
         salt=salt,
         length=32,
-        iterations=ARGON2_ITERACOES,
-        lanes=ARGON2_LANES,
-        memory_cost=ARGON2_MEMORIA_KIB,
+        iterations=int(params["iterations"]),
+        lanes=int(params["lanes"]),
+        memory_cost=int(params["memory_cost"]),
     )
-    chave = derivador.derive(master_password.encode())
+    chave = derivador.derive(senha)
+  else:
+    raise ArquivoCorrompido(f"KDF desconhecido no cofre: {kdf!r}")
   return base64.urlsafe_b64encode(chave)
 
 
@@ -263,7 +466,14 @@ def carregar_dados_criptografados(master_password: str):
   try:
     salt = base64.b64decode(conteudo["salt"], validate=True)
     kdf = conteudo.get("kdf", KDF_LEGADO)
-    chave = gerar_chave_fernet(master_password, salt, kdf=kdf)
+    params = conteudo.get("kdf_params")
+    if params is None:
+      # v1: os parametros nao estavam no arquivo; usa a copia congelada da
+      # epoca (NAO as constantes atuais, que podem ter mudado).
+      params = _parametros_kdf_formato_1(kdf)
+    else:
+      params = _validar_parametros_kdf(kdf, params)
+    chave = gerar_chave_fernet(master_password, salt, kdf=kdf, params=params)
     fernet = Fernet(chave)
     dados_decriptados = fernet.decrypt(
         conteudo["encrypted_data"].encode()
@@ -320,13 +530,18 @@ def salvar_dados_criptografados(dados: dict, master_password: str):
   else:
     salt = os.urandom(TAMANHO_SALT)
 
-  chave = gerar_chave_fernet(master_password, salt)
+  params = _parametros_kdf_atuais()
+  chave = gerar_chave_fernet(
+      master_password, salt, kdf=KDF_ATUAL, params=params
+  )
   fernet = Fernet(chave)
   dados_criptografados = fernet.encrypt(
       json.dumps(dados).encode()
   ).decode()
   payload = {
+      "version": VERSAO_FORMATO_COFRE,
       "kdf": KDF_ATUAL,
+      "kdf_params": params,
       "salt": base64.b64encode(salt).decode(),
       "encrypted_data": dados_criptografados,
   }
@@ -353,6 +568,115 @@ def _senha_fraca(senha: str) -> bool:
   return len(senha) < 16 and classes < 3
 
 
+def _descartar_sequencia_escape(fd):
+  """Consome o resto de uma sequencia de escape (setas, Home, Delete...)."""
+  try:
+    pronto, _, _ = select.select([fd], [], [], 0.02)
+  except (OSError, ValueError):
+    return
+  if not pronto:
+    return
+  primeiro = os.read(fd, 1)
+  if primeiro not in (b"[", b"O"):
+    return
+  while True:
+    try:
+      pronto, _, _ = select.select([fd], [], [], 0.02)
+    except (OSError, ValueError):
+      return
+    if not pronto:
+      return
+    byte = os.read(fd, 1)
+    if not byte or 0x40 <= byte[0] <= 0x7E:
+      return
+
+
+def ler_senha_mascarada(prompt="", mascara="*"):
+  """Le uma senha mostrando um '*' por caractere digitado.
+
+  Usado nos prompts da Senha Mestra. O eco real do terminal fica desligado
+  (modo cbreak): a senha nunca aparece na tela, apenas a mascara. Backspace,
+  Ctrl+U (limpar tudo) e Ctrl+W (apagar a ultima palavra) funcionam; setas,
+  Home e Delete sao ignoradas. Fora de um terminal (pipe/arquivo), le a
+  linha normalmente, sem tentar mascarar.
+  """
+  if termios is None:
+    # Windows: o getpass nativo ja mostra '*' por caractere.
+    return getpass.getpass(prompt)
+
+  if not sys.stdin.isatty():
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    linha = sys.stdin.readline()
+    if not linha:
+      raise EOFError
+    return linha.rstrip("\r\n")
+
+  fd = sys.stdin.fileno()
+  configuracoes = termios.tcgetattr(fd)
+  senha = []
+  decodificador = codecs.getincrementaldecoder(
+      sys.stdin.encoding or "utf-8"
+  )("replace")
+
+  def apagar_um():
+    if senha:
+      senha.pop()
+      sys.stdout.write("\b \b")
+      sys.stdout.flush()
+
+  try:
+    # TCSANOW: nao descarta o que o usuario ja digitou antes do prompt.
+    tty.setcbreak(fd, termios.TCSANOW)
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    while True:
+      byte = os.read(fd, 1)
+      if not byte:
+        break
+      if byte == b"\x1b":
+        _descartar_sequencia_escape(fd)
+        continue
+      if byte in (b"\r", b"\n"):
+        break
+      if byte == b"\x03":  # Ctrl+C (caso ISIG nao transforme em sinal)
+        raise KeyboardInterrupt
+      if byte == b"\x04":  # Ctrl+D
+        if not senha:
+          raise EOFError
+        break
+      if byte in (b"\x7f", b"\x08"):  # Backspace
+        apagar_um()
+        continue
+      if byte == b"\x15":  # Ctrl+U
+        while senha:
+          apagar_um()
+        continue
+      if byte == b"\x17":  # Ctrl+W
+        while senha and senha[-1].isspace():
+          apagar_um()
+        while senha and not senha[-1].isspace():
+          apagar_um()
+        continue
+      if byte[0] < 0x20:
+        continue
+      # Decodifica UTF-8 incrementalmente: um '*' por caractere, nao por byte.
+      for caractere in decodificador.decode(byte):
+        if caractere < " ":
+          continue
+        senha.append(caractere)
+        sys.stdout.write(mascara)
+        sys.stdout.flush()
+  finally:
+    try:
+      termios.tcsetattr(fd, termios.TCSADRAIN, configuracoes)
+    except Exception:
+      pass
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+  return "".join(senha)
+
+
 def obter_dados_e_autenticar():
   """Cria/desbloqueia o banco de dados com a senha mestra.
 
@@ -365,8 +689,8 @@ def obter_dados_e_autenticar():
         "\npara proteger as carteiras salvas neste computador."
     )
     while True:
-      pwd1 = getpass.getpass("Digite a nova Senha Mestra: ")
-      pwd2 = getpass.getpass("Confirme a Senha Mestra: ")
+      pwd1 = ler_senha_mascarada("Digite a nova Senha Mestra: ")
+      pwd2 = ler_senha_mascarada("Confirme a Senha Mestra: ")
       if pwd1 != pwd2:
         print("As senhas nao coincidem. Tente novamente.\n")
         continue
@@ -397,35 +721,50 @@ def obter_dados_e_autenticar():
           "o campo 'encrypted_data' nao contem um token Fernet valido"
       )
     while True:
-      pwd = getpass.getpass(
+      pwd = ler_senha_mascarada(
           "\nDigite sua Senha Mestra para desbloquear o banco de dados: "
       )
       dados = carregar_dados_criptografados(pwd)
       if dados is not None:
-        _avisar_migracao_legado()
+        _migrar_formato_se_preciso(dados, pwd)
         return dados, pwd
       print("Senha Mestra incorreta! Tente novamente.")
 
 
-def _kdf_do_arquivo(caminho: str = None) -> str:
-  """Le o campo 'kdf' do arquivo; ausente => formato legado (PBKDF2)."""
+def _versao_do_arquivo(caminho: str = None) -> int:
+  """Le a versao do formato do cofre; ausente => v1 (parametros implicitos)."""
   if caminho is None:
     caminho = ARQUIVO_CARTEIRAS
   try:
     with open(caminho, "r") as f:
       conteudo = json.load(f)
-    return conteudo.get("kdf", KDF_LEGADO)
-  except (OSError, ValueError, json.JSONDecodeError):
-    return KDF_LEGADO
+    return int(conteudo.get("version", 1))
+  except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    return 1
 
 
-def _avisar_migracao_legado():
-  """Informa que o arquivo sera migrado de PBKDF2 para Argon2id ao salvar."""
-  if _kdf_do_arquivo() == KDF_LEGADO:
-    print(
-        "\nNOTA: este arquivo usa o formato antigo (PBKDF2). Ele sera"
-        "\nmigrado automaticamente para Argon2id na proxima gravacao."
+def _migrar_formato_se_preciso(dados, master_password):
+  """Regrava o cofre no formato atual (parametros de KDF gravados).
+
+  Executado logo apos desbloquear, com a senha correta em maos. Sem isso, um
+  cofre v1 continuaria dependendo das constantes ARGON2_* do codigo: mudar
+  qualquer uma delas o tornaria ilegivel para sempre.
+  """
+  if _versao_do_arquivo() >= VERSAO_FORMATO_COFRE:
+    return
+  try:
+    salvar_dados_criptografados(dados, master_password)
+  except (ArquivoCorrompido, OSError) as e:
+    erro(
+        f"nao foi possivel migrar o cofre para o formato atual: {e}\n"
+        "O arquivo NAO foi alterado. NAO mude as constantes ARGON2_* antes"
+        "\nde conseguir salvar o cofre com sucesso."
     )
+    return
+  print(
+      "Cofre migrado para o formato atual: os parametros do KDF agora"
+      "\nficam gravados no arquivo."
+  )
 
 
 # ==========================================================
@@ -597,8 +936,30 @@ def _consultar_endereco(address):
     return "vazio"
 
 
+def motivo_wif_invalida(wif):
+  """Motivo de a WIF nao servir para gasto P2WPKH, ou None se ela serve."""
+  if not isinstance(wif, str) or not wif:
+    return "WIF vazia."
+  try:
+    bruto = base58.b58decode_check(wif)
+  except Exception:
+    return "isso nao e uma WIF valida (base58/checksum)."
+  if len(bruto) == 33:
+    return (
+        "essa WIF e de chave NAO COMPRIMIDA (formato antigo, comeca com"
+        "\n'5'). Gasto P2WPKH (bc1q...) exige chave comprimida: a rede"
+        "\npadrao rejeita assinatura com pubkey de 65 bytes. Use uma"
+        "\nferramenta com suporte a P2PKH legado para mover esses fundos."
+    )
+  if len(bruto) != 34 or bruto[0] != 0x80 or bruto[-1] != 0x01:
+    return "formato de WIF nao suportado (esperado mainnet comprimida)."
+  return None
+
+
 def wif_para_endereco_p2wpkh(wif):
-  """Converte uma WIF no endereco P2WPKH correspondente (ou None)."""
+  """Converte uma WIF COMPRIMIDA no endereco P2WPKH correspondente (ou None)."""
+  if motivo_wif_invalida(wif) is not None:
+    return None
   try:
     chave = ec.PrivateKey.from_wif(wif)
     return script.p2wpkh(chave.get_public_key()).address()
@@ -958,6 +1319,10 @@ def resolver_origem(carteira, opcao, enderecos_conhecidos):
 
   # WIF?
   if re.fullmatch(r"[5KLc9][1-9A-HJ-NP-Za-km-z]{50,51}", opcao):
+    motivo = motivo_wif_invalida(opcao)
+    if motivo is not None:
+      erro(motivo)
+      return None, None, None
     endereco = wif_para_endereco_p2wpkh(opcao)
     if endereco is None:
       erro("WIF invalida.")
@@ -1077,7 +1442,18 @@ def resolver_origem_por_endereco(carteira, endereco, enderecos_conhecidos):
   if chave_meta is not None:
     meta = enderecos_conhecidos[chave_meta]
     if meta.get("wif"):
-      chave = ec.PrivateKey.from_wif(meta["wif"])
+      motivo = motivo_wif_invalida(meta["wif"])
+      if motivo is not None:
+        erro(
+            f"a origem {meta.get('endereco')} nao pode ser gasta por este"
+            f" programa:\n{motivo}"
+        )
+        return None, None, None
+      try:
+        chave = ec.PrivateKey.from_wif(meta["wif"])
+      except Exception as e:
+        erro(f"chave privada invalida para {meta.get('endereco')}: {e}")
+        return None, None, None
       return meta, script.p2wpkh(chave.get_public_key()), chave
 
   # 2) Deriva as contas conhecidas (e a padrao) para achar o indice.
@@ -1279,6 +1655,13 @@ def criar_transacao(carteira):
       erro(
           f"a origem {meta['endereco']} nao tem chave privada; "
           "nao e possivel assinar."
+      )
+      return
+    motivo = motivo_wif_invalida(wif)
+    if motivo is not None:
+      erro(
+          f"a origem {meta['endereco']} nao pode ser gasta por este"
+          f" programa:\n{motivo}"
       )
       return
     try:
@@ -1581,7 +1964,7 @@ def menu_carteira(mnemonic, passphrase, exibir_mnemonic, metadados=None):
     print("3 - Consultar saldo e transacoes do endereco")
     print("4 - Criar transacao (enviar BTC)")
     print("5 - Exportar todas as chaves (WIF) em texto")
-    print("0 - Voltar")
+    print("0 - Voltar ao menu principal")
 
     esc = input("Escolha: ").strip()
 
@@ -1664,17 +2047,18 @@ def exportar_chaves(carteira):
 
 
 def perguntar_e_salvar_carteira(mnemonic, passphrase, metadados=None):
+  """Pergunta e grava a carteira. Retorna True somente se ela foi persistida."""
   resposta = input(
       "\nDeseja salvar essa carteira no sistema? (s/n): "
   ).strip().lower()
   if resposta != "s":
-    return
+    return False
   try:
     dados, master_password = obter_dados_e_autenticar()
     nome = input("\nDigite um nome/alias para esta carteira: ").strip()
     if not nome:
       print("Nome vazio; carteira nao salva.")
-      return
+      return False
     if nome in dados:
       print("Aviso: ja existe uma carteira com este nome; sera atualizada.")
     dados[nome] = {
@@ -1684,11 +2068,16 @@ def perguntar_e_salvar_carteira(mnemonic, passphrase, metadados=None):
     }
     salvar_dados_criptografados(dados, master_password)
     print("Carteira criptografada e salva com sucesso!")
+    return True
   except ArquivoCorrompido as e:
     erro(
         f"{ARQUIVO_CARTEIRAS} esta corrompido ({e}). A carteira NAO foi "
         "salva. Remova ou renomeie o arquivo para recomecar."
     )
+    return False
+  except OSError as e:
+    erro(f"falha de gravacao em {ARQUIVO_CARTEIRAS}: {e}")
+    return False
 
 
 def criar_carteira():
@@ -1704,12 +2093,52 @@ def criar_carteira():
   criar_wallet_e_perguntar_salvar(mnemonic, passphrase, metadados)
 
 
-def criar_wallet_e_perguntar_salvar(mnemonic, passphrase, metadados):
+def _mostrar_semente_para_anotar(mnemonic, passphrase):
+  """Exibe a semente ANTES de gravar, para o usuario conferir que anotou."""
+  print("\n" + "=" * 64)
+  print("ANOTE A SEMENTE AGORA (ela nao sera exibida ao carregar depois)")
+  print("=" * 64)
+  print(f"Semente (Mnemonic): {mnemonic}")
+  print(f"Passphrase: {'[CONFIGURADA]' if passphrase else '[NENHUMA]'}")
+  if passphrase:
+    print(
+        "ATENCAO: sem essa Passphrase, a semente sozinha NAO recupera a"
+        "\ncarteira. Guarde as duas coisas."
+    )
+  print("=" * 64)
+
+
+def criar_wallet_e_perguntar_salvar(
+    mnemonic, passphrase, metadados, mostrar_seed_antes_de_salvar=True
+):
+  """Grava a carteira ANTES de abrir o menu.
+
+  Antes, a gravacao so acontecia depois que o usuario saia do menu: um
+  Ctrl+C/crash nesse meio-tempo perdia a seed recem-gerada.
+  """
+  exibir_no_menu = True
+  if mostrar_seed_antes_de_salvar and mnemonic:
+    _mostrar_semente_para_anotar(mnemonic, passphrase)
+    input("\nConfira que anotou a semente e pressione Enter...")
+    exibir_no_menu = False
+
+  while not perguntar_e_salvar_carteira(mnemonic, passphrase, metadados):
+    print(
+        "\nATENCAO: a carteira NAO foi gravada. A seed existe apenas na"
+        "\ntela/memoria; se voce nao anotou, os fundos enviados para ela"
+        "\nficarao inacessiveis."
+    )
+    conf = input(
+        'Digite "SEM SALVAR" para continuar mesmo assim (ou Enter para'
+        "\ntentar salvar de novo): "
+    ).strip().upper()
+    if conf == "SEM SALVAR":
+      break
+
   menu_carteira(
-      mnemonic, passphrase, exibir_mnemonic=True, metadados=metadados
+      mnemonic, passphrase, exibir_mnemonic=exibir_no_menu,
+      metadados=metadados,
   )
-  perguntar_e_salvar_carteira(mnemonic, passphrase, metadados)
-  input("\nPressione Enter para continuar...")
 
 
 def importar_carteira():
@@ -1740,7 +2169,10 @@ def importar_carteira():
     )
     metadados = {"contas": [CONTA_PADRAO], "enderecos": {}}
 
-  criar_wallet_e_perguntar_salvar(mnemonic, passphrase, metadados)
+  criar_wallet_e_perguntar_salvar(
+      mnemonic, passphrase, metadados,
+      mostrar_seed_antes_de_salvar=False,
+  )
 
 
 def importar_wif_como_carteira():
@@ -1759,6 +2191,12 @@ def importar_wif_como_carteira():
   wif = getpass.getpass("\nDigite a WIF a importar (sem eco): ").strip()
   if not wif:
     erro("nenhuma WIF informada.")
+    input("\nPressione Enter para voltar...")
+    return
+
+  motivo = motivo_wif_invalida(wif)
+  if motivo is not None:
+    erro(motivo)
     input("\nPressione Enter para voltar...")
     return
 
@@ -1901,9 +2339,12 @@ def gerenciar_carteiras():
         try:
           salvar_dados_criptografados(dados, master_password)
           print("Enderecos/metadados atualizados e salvos.")
-        except ArquivoCorrompido as e:
+        except (ArquivoCorrompido, OSError) as e:
           erro(f"falha ao salvar os metadados: {e}")
-      input("\nPressione Enter para continuar...")
+          input("\nPressione Enter para voltar ao menu principal...")
+      # "0 - Voltar" no menu da carteira volta direto ao menu principal,
+      # em vez de reabrir a lista de carteiras.
+      return
     else:
       confirm = input(
           f"Tem certeza que deseja deletar '{nome_escolhido}'? (s/n): "
@@ -1925,9 +2366,29 @@ def gerenciar_carteiras():
 
 
 def main():
+  global ARQUIVO_CARTEIRAS
+
+  try:
+    ARQUIVO_CARTEIRAS = resolver_arquivo_carteiras()
+  except RuntimeError as e:
+    erro(str(e))
+    return
+
+  try:
+    os.makedirs(os.path.dirname(ARQUIVO_CARTEIRAS), mode=0o700, exist_ok=True)
+  except OSError as e:
+    erro(f"nao foi possivel preparar a pasta do cofre: {e}")
+    return
+
+  problema_trava = adquirir_trava_exclusiva()
+  if problema_trava:
+    erro(problema_trava)
+    return
+
   while True:
     limpar_tela()
     print("=== GELOWALLET - Gerenciador de Enderecos e Lock Offline ===")
+    print(f"Cofre: {ARQUIVO_CARTEIRAS}")
     print("1 - Criar nova carteira (12 palavras + Passphrase)")
     print("2 - Carregar carteira existente (12/24 palavras + Passphrase)")
     print("3 - Visualizar/Deletar/Transacionar carteiras cadastradas")
