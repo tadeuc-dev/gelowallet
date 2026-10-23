@@ -17,6 +17,8 @@ Melhorias em relacao aos dois scripts originais:
     vez de abrir o errado.
   - Trava exclusiva (flock) impede duas instancias simultaneas de usar o
     mesmo cofre (antes, a ultima a salvar apagava as alteracoes da outra).
+    O arquivo .lock e removido ao sair (opcao 0 ou Ctrl+C), sem apagar a
+    trava de outra sessao.
   - A carteira e gravada ANTES de abrir o menu; antes, um Ctrl+C no meio do
     menu perdia a seed recem-gerada.
   - WIF de chave NAO comprimida (formato antigo, "5...") e recusada: gasto
@@ -290,12 +292,44 @@ def adquirir_trava_exclusiva():
         f"  {ARQUIVO_CARTEIRAS}\n"
         "Feche a outra sessao antes de continuar."
     )
+  _trava_cofre = arquivo
   try:
     os.chmod(caminho, 0o600)
   except OSError:
     pass
-  _trava_cofre = arquivo
   return None
+
+
+def liberar_trava_exclusiva():
+  """Remove o arquivo .lock e libera a trava ao sair do programa."""
+  global _trava_cofre
+  if _trava_cofre is None:
+    return
+
+  arquivo = _trava_cofre
+  _trava_cofre = None
+  caminho = ARQUIVO_CARTEIRAS + ".lock"
+
+  # Remove o caminho enquanto a trava ainda esta conosco. Antes, confere se
+  # o arquivo no caminho ainda e o mesmo inode que abrimos: se outra sessao
+  # tiver recriado a trava, nao apagamos o arquivo dela.
+  try:
+    nosso = os.fstat(arquivo.fileno())
+    atual = os.stat(caminho)
+    if (atual.st_dev, atual.st_ino) == (nosso.st_dev, nosso.st_ino):
+      os.unlink(caminho)
+  except OSError:
+    pass
+
+  if fcntl is not None:
+    try:
+      fcntl.flock(arquivo.fileno(), fcntl.LOCK_UN)
+    except OSError:
+      pass
+  try:
+    arquivo.close()
+  except OSError:
+    pass
 
 
 # ==========================================================
@@ -1988,6 +2022,9 @@ def menu_carteira(mnemonic, passphrase, exibir_mnemonic, metadados=None):
     elif esc == "5":
       exportar_chaves(carteira)
 
+    else:
+      erro("opcao incorreta. Digite 1, 2, 3, 4, 5 ou 0.")
+
 
 def escolher_endereco_conhecido(carteira):
   """Deixa escolher origem (conta/cadeia) e indice; devolve o item."""
@@ -2266,26 +2303,26 @@ def importar_wif_como_carteira():
 
 
 def gerenciar_carteiras():
+  limpar_tela()
+  print("=== 3. GERENCIAR CARTEIRAS SALVAS ===")
+
+  if not os.path.exists(ARQUIVO_CARTEIRAS):
+    print("Nenhuma carteira cadastrada.")
+    input("\nPressione Enter para voltar...")
+    return
+
+  try:
+    dados, master_password = obter_dados_e_autenticar()
+  except ArquivoCorrompido as e:
+    erro(
+        f"{ARQUIVO_CARTEIRAS} esta corrompido ({e}). Remova ou renomeie "
+        "o arquivo; as carteiras nele nao podem ser recuperadas por este"
+        " programa."
+    )
+    input("\nPressione Enter para voltar...")
+    return
+
   while True:
-    limpar_tela()
-    print("=== 3. GERENCIAR CARTEIRAS SALVAS ===")
-
-    if not os.path.exists(ARQUIVO_CARTEIRAS):
-      print("Nenhuma carteira cadastrada.")
-      input("\nPressione Enter para voltar...")
-      return
-
-    try:
-      dados, master_password = obter_dados_e_autenticar()
-    except ArquivoCorrompido as e:
-      erro(
-          f"{ARQUIVO_CARTEIRAS} esta corrompido ({e}). Remova ou renomeie "
-          "o arquivo; as carteiras nele nao podem ser recuperadas por este"
-          " programa."
-      )
-      input("\nPressione Enter para voltar...")
-      return
-
     if not dados:
       print("Nenhuma carteira encontrada no arquivo.")
       input("\nPressione Enter para voltar...")
@@ -2302,20 +2339,24 @@ def gerenciar_carteiras():
     print("D - Deletar uma carteira")
     print("0 - Voltar")
 
-    esc = input("\nEscolha: ").strip().upper()
+    # Repete apenas a pergunta da opcao; nao volta a pedir a Senha Mestra.
+    while True:
+      esc = input("\nEscolha: ").strip().upper()
+      if esc == "0":
+        return
+      if esc in ("L", "D"):
+        break
+      erro("opcao incorreta. Digite L, D ou 0.")
 
-    if esc == "0":
-      break
-    if esc not in ("L", "D"):
-      continue
-
-    idx = pedir_indice(
-        "Digite o numero da carteira: ", maximo=len(nomes) - 1
-    )
-    if idx is None:
-      erro("indice invalido.")
-      input("Pressione Enter...")
-      continue
+    while True:
+      idx = pedir_indice(
+          "Digite o numero da carteira: ", maximo=len(nomes) - 1
+      )
+      if idx is not None:
+        break
+      erro(
+          f"indice incorreto. Digite um numero entre 0 e {len(nomes) - 1}."
+      )
 
     nome_escolhido = nomes[idx]
     if esc == "L":
@@ -2355,7 +2396,7 @@ def gerenciar_carteiras():
         del dados[nome_escolhido]
         salvar_dados_criptografados(dados, master_password)
         print("Carteira deletada com sucesso!")
-      except ArquivoCorrompido as e:
+      except (ArquivoCorrompido, OSError) as e:
         erro(f"falha ao salvar apos delecao: {e}")
       input("Pressione Enter...")
 
@@ -2423,3 +2464,5 @@ if __name__ == "__main__":
   except KeyboardInterrupt:
     print("\n\nInterrompido pelo usuario. Saindo...")
     sys.exit(130)
+  finally:
+    liberar_trava_exclusiva()

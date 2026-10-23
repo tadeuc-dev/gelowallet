@@ -74,6 +74,8 @@ decisão de transmitir para você.
 - Senha Mestra com mínimo de **12 caracteres** e aviso de senha fraca.
 - Senha Mestra digitada com **eco mascarado** (`*` por caractere); o mnemonic, a passphrase e a WIF continuam **sem eco** (`getpass`).
 - Detecção clara de arquivo corrompido × senha incorreta.
+- Trava de instância única (`wallets.json.lock`) impede duas sessões simultâneas; o arquivo é removido ao sair normalmente ou com Ctrl+C, sem apagar a trava de outra sessão.
+- Opção inválida nos menus de carteiras mostra o erro na hora e reabre a digitação, sem pedir a Senha Mestra novamente.
 
 ---
 
