@@ -357,6 +357,7 @@ convencionais enviam o troco para um **endereço novo da cadeia interna**
 ```
 gelowallet.py     # programa completo, sem segredos; pode ir para um pendrive
 README.md         # este arquivo
+LICENSE           # licença MIT
 wallets.json      # cofre criptografado; opcional no pendrive
 ```
 
@@ -429,8 +430,13 @@ risco e teste primeiro com valores pequenos.
 
 ## Licença
 
-Defina aqui a licença do seu repositório (ex.: MIT).
+Este projeto é software livre e de código aberto, distribuído sob a licença
+**MIT**.
 
-```
-MIT License — ajuste conforme sua preferência.
-```
+Copyright (c) 2026 Tadeu Cadilhe
+
+O texto completo está em [LICENSE](LICENSE).
+
+A licença MIT permite usar, copiar, modificar, distribuir, sublicenciar e vender
+o software, desde que o aviso de copyright e a permissão sejam mantidos. O
+software é fornecido "como está", sem garantias.
