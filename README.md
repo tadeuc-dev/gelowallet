@@ -43,6 +43,38 @@ Ele foi pensado como um **cofre offline**: em vez de uma carteira online com
 transmissão automática, o GELOWALLET produz a transação assinada e deixa a
 decisão de transmitir para você.
 
+## Portabilidade: um script, um cofre, qualquer lugar
+
+Um dos objetivos do projeto é ser **portátil de propósito**: não existe
+instalador, serviço, banco de dados nem diretório fixo. O programa é um único
+`gelowallet.py`, e o estado fica em um único `wallets.json`. Você pode copiar os
+dois para um **pendrive**, uma pasta qualquer ou uma máquina offline e executar
+com `python3 gelowallet.py`.
+
+- **`gelowallet.py`** é o programa. Não contém segredos e pode ser copiado
+  livremente.
+- **`wallets.json`** é o cofre criptografado. Se quiser levar as carteiras,
+  leve esse arquivo junto.
+- O programa procura o cofre **primeiro na pasta do script**. Então, com os dois
+  arquivos no pendrive, ele abre o `wallets.json` do próprio pendrive.
+- Se preferir manter o cofre em casa e levar só o programa, aponte o caminho:
+  ```bash
+  GELOWALLET_VAULT=/caminho/para/wallets.json python3 gelowallet.py
+  ```
+- Se houver mais de um `wallets.json` nos caminhos procurados, ele **aborta**
+  em vez de abrir o cofre errado.
+
+Isso significa "arquivo único" no sentido de **código e cofre**, não de binário
+autossuficiente: a máquina ainda precisa de **Python 3.10+** e das dependências
+instaladas. E portabilidade não é licença para rodar em qualquer computador: um
+pendrive em uma máquina desconhecida continua exposto a keylogger e malware.
+Prefira uma máquina confiável, de preferência offline.
+
+> Em pendrives FAT32/exFAT, a permissão `0600` do `wallets.json` pode não ser
+> aplicada pelo sistema de arquivos. O cofre continua criptografado, mas, para
+> proteção extra, use um pendrive com LUKS/ext4 ou mantenha o cofre em um volume
+> criptografado.
+
 ---
 
 ## Recursos
@@ -160,6 +192,15 @@ pip install embit mnemonic qrcode base58 bech32 ecdsa requests cryptography pycr
 ```bash
 python3 gelowallet.py
 ```
+
+Ou, direto de um pendrive ou de outra pasta:
+
+```bash
+python3 /media/seu_usuario/GELOWALLET/gelowallet.py
+```
+
+Se o `wallets.json` estiver na mesma pasta do script, ele será usado
+automaticamente, sem instalar nada no sistema.
 
 Menu principal:
 
@@ -314,10 +355,15 @@ convencionais enviam o troco para um **endereço novo da cadeia interna**
 ## Estrutura do projeto
 
 ```
-gelowallet.py     # o programa (arquivo único)
+gelowallet.py     # programa completo, sem segredos; pode ir para um pendrive
 README.md         # este arquivo
-wallets.json      # cofre criptografado (gerado na 1ª gravação; permissão 0600)
+wallets.json      # cofre criptografado; opcional no pendrive
 ```
+
+Para levar o GELOWALLET a outro lugar, copie `gelowallet.py` e, se quiser abrir
+as mesmas carteiras, copie também `wallets.json`. Não há instalação do programa:
+basta Python e as dependências. O cofre é procurado primeiro ao lado do script;
+por isso, no pendrive, os dois arquivos podem ficar juntos.
 
 `wallets.json` (formato):
 
@@ -332,6 +378,11 @@ wallets.json      # cofre criptografado (gerado na 1ª gravação; permissão 06
 ---
 
 ## Perguntas frequentes
+
+**Preciso instalar o GELOWALLET?**
+Não. Ele é um script Python. Você pode executá-lo de qualquer pasta ou pendrive,
+desde que a máquina tenha Python 3.10+ e as dependências. O cofre fica no
+`wallets.json` ao lado do script ou no caminho indicado por `GELOWALLET_VAULT`.
 
 **O programa transmite a transação?**
 Não. Para P2WPKH ele gera o HEX assinado e um PSBT não assinado; para P2PKH
@@ -358,6 +409,9 @@ risco e teste primeiro com valores pequenos.
 ## Limitações
 
 - **Não transmite** transações.
+- **Não é um binário standalone**: exige Python 3.10+ e as dependências
+  instaladas. "Arquivo único" significa que o código e o cofre são portáteis,
+  não que o runtime do Python viaje junto.
 - O fluxo principal é **P2WPKH** (`bc1q...`); a opção 5 cobre **P2PKH legado**
   (`1...`, incluindo WIFs do BTC Puzzle). Não faz Taproot (`bc1p`) como origem
   nem multisig.
