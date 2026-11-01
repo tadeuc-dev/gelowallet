@@ -49,6 +49,8 @@ Melhorias em relacao aos dois scripts originais:
     absoluto), conferencia de valor minimo do destino, exportacao de HEX
     assinado e de PSBT (sem assinar, com derivacoes de entrada e de troco
     apenas para chaves derivadas do mnemonic; WIF importada nao tem path).
+  - O HEX assinado e copiado automaticamente para a area de transferencia
+    quando houver ferramenta disponivel (clip, pbcopy, wl-copy ou xclip/xsel).
   - Verificacao de seguranca: endereco derivado pela embit deve bater com
     o endereco derivado pela implementacao propria antes de assinar.
   - Dados de derivacao (conta, cadeia, indices ja usados) sao salvos junto
@@ -82,6 +84,8 @@ import math
 import os
 import re
 import select
+import shutil
+import subprocess
 import sys
 import tempfile
 
@@ -1366,6 +1370,56 @@ def salvar_conteudo_em_arquivo(nome_padrao, conteudo, descricao):
     erro(f"nao foi possivel salvar: {e}")
 
 
+def _copiar_para_area_de_transferencia(texto):
+  """Copia texto para a area de transferencia (best effort).
+
+  Usa ferramentas nativas do sistema, sem dependencia Python extra:
+  clip (Windows), pbcopy (macOS), wl-copy (Wayland) e xclip/xsel (X11).
+  Retorna True se alguma funcionou; False se nao ha como copiar (ex.: SSH
+  sem servidor grafico). O HEX de uma transacao assinada e dado publico.
+  """
+  dados = texto.encode("utf-8")
+  if sys.platform.startswith("win"):
+    candidatos = [["clip"]]
+  elif sys.platform == "darwin":
+    candidatos = [["pbcopy"]]
+  else:
+    # Wayland primeiro; X11 como alternativa.
+    candidatos = [
+        ["wl-copy"],
+        ["xclip", "-selection", "clipboard"],
+        ["xsel", "--clipboard", "--input"],
+    ]
+  for comando in candidatos:
+    if shutil.which(comando[0]) is None:
+      continue
+    try:
+      resultado = subprocess.run(
+          comando,
+          input=dados,
+          stdout=subprocess.DEVNULL,
+          stderr=subprocess.DEVNULL,
+          timeout=3,
+          check=False,
+      )
+      if resultado.returncode == 0:
+        return True
+    except (OSError, subprocess.SubprocessError):
+      continue
+  return False
+
+
+def copiar_hex_para_area_de_transferencia(raw_hex):
+  """Copia o HEX assinado e informa o resultado ao usuario."""
+  if _copiar_para_area_de_transferencia(raw_hex):
+    print("HEX copiado para a area de transferencia.")
+  else:
+    print(
+        "Nao foi possivel copiar automaticamente. Instale wl-clipboard"
+        "\n(Wayland) ou xclip/xsel (X11), ou salve o HEX em arquivo."
+    )
+
+
 # ==========================================================
 # CRIACAO DE TRANSACAO P2WPKH
 # ==========================================================
@@ -2089,6 +2143,7 @@ def criar_transacao(carteira):
   print(f"Taxa efetiva real: {taxa_real / vsize_real:.2f} sat/vB")
   print("\nRAW HEX:")
   print(raw_hex)
+  copiar_hex_para_area_de_transferencia(raw_hex)
   print("=" * 64)
   print(
       "\nA transacao NAO foi transmitida automaticamente. Confira o HEX, "
@@ -2574,6 +2629,7 @@ def criar_transacao_p2pkh(carteira):
   )
   print("\nRAW HEX:")
   print(raw_hex)
+  copiar_hex_para_area_de_transferencia(raw_hex)
   print("=" * 64)
   print(
       "\nA transacao NAO foi transmitida. Confira o HEX, os valores e os"
