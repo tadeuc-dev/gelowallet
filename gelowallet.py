@@ -47,7 +47,8 @@ Melhorias em relacao aos dois scripts originais:
   - Transacao com: filtro de UTXOs confirmados, RBF sinalizado, dust correto
     para P2WPKH (294 sats), aviso de taxa excessiva (percentual OU valor
     absoluto), conferencia de valor minimo do destino, exportacao de HEX
-    assinado e de PSBT (sem assinar, com derivacoes de entrada e de troco).
+    assinado e de PSBT (sem assinar, com derivacoes de entrada e de troco
+    apenas para chaves derivadas do mnemonic; WIF importada nao tem path).
   - Verificacao de seguranca: endereco derivado pela embit deve bater com
     o endereco derivado pela implementacao propria antes de assinar.
   - Dados de derivacao (conta, cadeia, indices ja usados) sao salvos junto
@@ -1391,6 +1392,8 @@ def montar_entradas(naturezas, valor, taxa_vb, spk_destino):
               "conta": grupo["meta"]["conta"],
               "index": grupo["meta"]["index"],
               "fingerprint": grupo["meta"]["fingerprint"],
+              # So chaves derivadas do mnemonic recebem bip32_derivations.
+              "derivada": bool(grupo["meta"].get("derivada", False)),
           }
       )
   todas.sort(key=lambda u: u["value"], reverse=True)
@@ -1470,13 +1473,15 @@ def _meta_de_entrada(item):
       "conta": item["conta"],
       "index": item["index"],
       "fingerprint": item["fingerprint"],
+      "derivada": item.get("derivada", False),
   }
 
 
 def _marcar_troco_no_psbt(p, saidas, endereco_troco, origens):
   """Se a saida de troco for nossa, adiciona PSBT_OUT_BIP32_DERIVATION.
 
-  Ajuda a outra carteira a reconhecer o troco automaticamente.
+  Ajuda a outra carteira a reconhecer o troco automaticamente. So marca
+  chaves derivadas do mnemonic: WIF importada nao tem caminho BIP32 real.
   """
   alvo = None
   for origem in origens:
@@ -1484,6 +1489,8 @@ def _marcar_troco_no_psbt(p, saidas, endereco_troco, origens):
       alvo = origem["meta"]
       break
   if alvo is None:
+    return
+  if not alvo.get("derivada"):
     return
   for indice, saida in enumerate(saidas):
     if saida.script_pubkey.address().lower() != endereco_troco.lower():
@@ -1596,6 +1603,7 @@ def resolver_origem(carteira, opcao, enderecos_conhecidos):
       "conta": conta,
       "index": indice,
       "fingerprint": fingerprint,
+      "derivada": True,
   }
   chave = ec.PrivateKey.from_wif(item["privado"])
   return meta, script.p2wpkh(chave.get_public_key()), chave
@@ -1674,6 +1682,7 @@ def resolver_origem_por_endereco(carteira, endereco, enderecos_conhecidos):
             "conta": conta,
             "index": item["index"],
             "fingerprint": _fingerprint_hex(carteira),
+            "derivada": True,
         }
         chave = ec.PrivateKey.from_wif(item["privado"])
         return meta, spk, chave
@@ -1930,6 +1939,8 @@ def criar_transacao(carteira):
                 "conta": grupo["meta"]["conta"],
                 "index": grupo["meta"]["index"],
                 "fingerprint": grupo["meta"]["fingerprint"],
+                # So chaves derivadas do mnemonic recebem bip32_derivations.
+                "derivada": bool(grupo["meta"].get("derivada", False)),
             }
         )
     total_entradas = total_disponivel
@@ -2114,11 +2125,14 @@ def criar_transacao(carteira):
           p.inputs[i].witness_utxo = transaction.TransactionOutput(
               value=item["value"], script_pubkey=item["scriptPubKey"]
           )
-          p.inputs[i].bip32_derivations[pub_key] = _caminho_psbt_entrada(
-              _meta_de_entrada(item)
-          )
+          # WIF importada nao tem caminho BIP32 real: omitir a derivacao.
+          if item.get("derivada"):
+            p.inputs[i].bip32_derivations[pub_key] = _caminho_psbt_entrada(
+                _meta_de_entrada(item)
+            )
         # Marca a saida de troco como nossa (PSBT_OUT_BIP32_DERIVATION),
-        # para outra carteira reconhecer o troco automaticamente.
+        # para outra carteira reconhecer o troco automaticamente. So quando
+        # a chave de troco vem do mnemonic (WIF importada fica de fora).
         if tem_troco and endereco_troco:
           _marcar_troco_no_psbt(p, saidas, endereco_troco, origens)
         psbt_b64 = base64.b64encode(p.serialize()).decode()
